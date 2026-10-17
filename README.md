@@ -10,7 +10,9 @@ Local control for the Korean **LG U+ / TONLY MTTL-W01** 4-outlet smart power str
 - Name each outlet, set the appliance type and room
 - Timers (on for / off after / on after) and schedules (repeat days or one-time, optional auto-off)
 - Charger mode: switch off automatically when a phone or laptop finishes charging
-- Daily energy per appliance, with cost in EGP
+- Energy dashboard: day (hourly), week, month, year or any date range; comparison with the previous period; breakdown by appliance or room; cost in EGP; Excel export
+- LG TVs (webOS): find on the network, pair, power, volume, mute, channel, input — all local
+- LG ThinQ appliances (air conditioners, washers, fridges, …) through LG's official ThinQ Connect API
 - Guided Wi-Fi setup for new strips, network diagnostics, optional password
 - Arabic and English interface
 - SQLite storage (`mttl.db`)
@@ -32,6 +34,15 @@ Once per strip. With this computer on your home Wi-Fi (2.4 GHz):
 
 The strip stores your Wi-Fi and this computer's IP address and connects by itself from then on. Reserve this computer's IP in your router (DHCP reservation) so it never changes.
 
+## LG devices · أجهزة LG
+
+Open **Settings → Connect LG devices**.
+
+- **TV (webOS):** with the TV on, press **Find TV** (or type its IP) and **Pair**, then accept the request on the TV with the remote. To turn it on from off, enable *Turn on via Wi-Fi / LAN* on the TV; the app sends Wake-on-LAN to the TV's MAC address.
+- **ThinQ appliances:** create a Personal Access Token at [connect-pat.lgthinq.com](https://connect-pat.lgthinq.com) (sign in with your ThinQ account → *ADD NEW TOKEN* → tick all permissions → *CREATE TOKEN*), paste it with your country code (e.g. `EG`) and press **Connect**. Devices must already be added in the LG ThinQ app. Controls are built from each device's own profile, so any ThinQ device type works.
+
+TV control follows the protocol used by [aiowebostv](https://github.com/home-assistant-libs/aiowebostv); ThinQ calls follow LG's official [pythinqconnect](https://github.com/thinq-connect/pythinqconnect).
+
 ## How it works · طريقة العمل
 
 | Step | Direction | Message |
@@ -50,7 +61,7 @@ Protocol details come from community reverse-engineering work:
 |---|---|
 | `mttl_app.py` | The whole app: device server, scheduler, web UI (Python standard library only) |
 | `Start-Strip.bat` | Windows launcher: finds Python, opens the firewall port, starts the app |
-| `mttl.db` | Created on first run — strips, outlets, schedules, energy history (not committed) |
+| `mttl.db` | Created on first run — strips, outlets, schedules, energy history, LG tokens (not committed) |
 
 ## Notes
 

@@ -18,6 +18,7 @@ and github.com/HanyArnous/power_strip):
              app   -> up:onoff:<1-4>:<on|off>
              strip -> up:onoff:N:on / up:event:onoff:N:on
 """
+import base64
 import collections
 import datetime
 import hashlib
@@ -30,12 +31,16 @@ import re
 import secrets
 import socket
 import socketserver
+import ssl
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1155,6 +1160,454 @@ def run_diagnostics():
     }
 
 
+# ================================================================ LG devices
+# ---------------------------------------------------------------- minimal WebSocket client (RFC 6455)
+class WSClient:
+    def __init__(self, host, port, tls, timeout=6.0):
+        raw = socket.create_connection((host, port), timeout=timeout)
+        if tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE          # webOS uses a self-signed certificate
+            raw = ctx.wrap_socket(raw, server_hostname=host)
+        raw.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        raw.sendall(("GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % (host, port, key)).encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = raw.recv(4096)
+            if not chunk:
+                raise ConnectionError("handshake closed")
+            resp += chunk
+            if len(resp) > 65536:
+                raise ConnectionError("handshake too long")
+        head, self.buf = resp.split(b"\r\n\r\n", 1)
+        if b" 101" not in head.split(b"\r\n")[0]:
+            raise ConnectionError("websocket refused: %r" % head.split(b"\r\n")[0])
+        self.sock = raw
+
+    def send(self, obj):
+        data = json.dumps(obj).encode("utf-8")
+        n = len(data)
+        hdr = bytearray([0x81])
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+        else:
+            hdr += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+        mask = os.urandom(4)
+        self.sock.sendall(bytes(hdr) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("connection closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def recv(self, timeout=6.0):
+        self.sock.settimeout(timeout)
+        msg = b""
+        while True:
+            b1, b2 = self._read(2)
+            op, ln = b1 & 0x0F, b2 & 0x7F
+            if ln == 126:
+                ln = int.from_bytes(self._read(2), "big")
+            elif ln == 127:
+                ln = int.from_bytes(self._read(8), "big")
+            mask = self._read(4) if b2 & 0x80 else None
+            payload = self._read(ln)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if op == 0x8:
+                raise ConnectionError("closed by TV")
+            if op == 0x9:                                  # ping -> pong
+                self.sock.sendall(bytes([0x8A, 0x80 | len(payload)]) + b"\0\0\0\0" + payload)
+                continue
+            if op in (0x1, 0x0):
+                msg += payload
+                if b1 & 0x80:
+                    return json.loads(msg.decode("utf-8"))
+
+    def close(self):
+        try:
+            self.sock.sendall(bytes([0x88, 0x80]) + b"\0\0\0\0")
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- webOS TV (local network)
+WEBOS_PERMISSIONS = [
+    "APP_TO_APP", "CLOSE", "CONTROL_AUDIO", "CONTROL_DISPLAY", "CONTROL_INPUT_JOYSTICK",
+    "CONTROL_INPUT_MEDIA_PLAYBACK", "CONTROL_INPUT_MEDIA_RECORDING", "CONTROL_INPUT_TEXT", "CONTROL_INPUT_TV",
+    "CONTROL_MOUSE_AND_KEYBOARD", "CONTROL_POWER", "CONTROL_TV_SCREEN", "LAUNCH", "LAUNCH_WEBAPP",
+    "READ_APP_STATUS", "READ_COUNTRY_INFO", "READ_CURRENT_CHANNEL", "READ_INPUT_DEVICE_LIST",
+    "READ_INSTALLED_APPS", "READ_LGE_SDX", "READ_LGE_TV_INPUT_EVENTS", "READ_NETWORK_STATE",
+    "READ_NOTIFICATIONS", "READ_POWER_STATE", "READ_RUNNING_APPS", "READ_SETTINGS", "READ_TV_CHANNEL_LIST",
+    "READ_TV_CURRENT_TIME", "READ_UPDATE_INFO", "SEARCH", "TEST_OPEN", "TEST_PROTECTED", "TEST_SECURE",
+    "UPDATE_FROM_REMOTE_APP", "WRITE_NOTIFICATION_ALERT", "WRITE_NOTIFICATION_TOAST", "WRITE_SETTINGS"]
+TVS = CFG.setdefault("tvs", [])            # [{id, ip, mac, name, key, tls}]
+TV_STATE = {}                               # id -> {on, volume, muted, app, inputs, error, at}
+TV_PAIR = {"running": False, "id": None, "result": None, "msg": ""}
+TV_LOCKS = {}
+
+
+class TVError(Exception):
+    pass
+
+
+def _tv_open(tv, pair_wait=0):
+    """Connect, register (pairing prompt on first use) and return an open WSClient."""
+    last = None
+    order = [(3001, True), (3000, False)] if tv.get("tls") else [(3000, False), (3001, True)]
+    for port, tls in order:
+        try:
+            ws = WSClient(tv["ip"], port, tls, timeout=4)
+            tv["tls"] = tls
+            break
+        except (OSError, ConnectionError, ssl.SSLError) as e:
+            last = e
+    else:
+        raise TVError(tr("التلفزيون مش بيرد على %s (مقفول أو مش على نفس الشبكة)", "TV at %s isn't answering (off or not on this network)") % tv["ip"]) from last
+    try:
+        ws.send({"id": "hello", "type": "hello", "payload": {}})
+        ws.recv(5)
+        ws.send({"id": "sysinfo", "type": "request", "uri": "ssap://system/getSystemInfo", "payload": {}})
+        try:
+            info = ws.recv(5)
+            if info.get("type") == "response" and info.get("payload", {}).get("modelName"):
+                tv.setdefault("model", info["payload"]["modelName"])
+        except (socket.timeout, ValueError):
+            pass
+        reg = {"forcePairing": False, "pairingType": "PROMPT",
+               "manifest": {"appVersion": "1.1", "manifestVersion": 1, "permissions": WEBOS_PERMISSIONS}}
+        if tv.get("key"):
+            reg["client-key"] = tv["key"]
+        ws.send({"type": "register", "id": "register_0", "payload": reg})
+        deadline = time.time() + (pair_wait or 8)
+        while time.time() < deadline:
+            r = ws.recv(max(1.0, deadline - time.time()))
+            if r.get("type") == "registered":
+                tv["key"] = r.get("payload", {}).get("client-key", tv.get("key"))
+                return ws
+            if r.get("type") == "error":
+                raise TVError(tr("التلفزيون رفض الاتصال: %s", "The TV rejected the connection: %s") % r.get("error"))
+            if r.get("type") == "response" and r.get("payload", {}).get("pairingType") == "PROMPT" and not pair_wait:
+                raise TVError(tr("التلفزيون محتاج يتربط تاني — اربطه من الإعدادات", "The TV needs pairing again — pair it from Settings"))
+        raise TVError(tr("ما حدش وافق على الطلب على شاشة التلفزيون", "Nobody accepted the request on the TV screen"))
+    except Exception:
+        ws.close()
+        raise
+
+
+def tv_request(tv, uri, payload=None, timeout=6):
+    lock = TV_LOCKS.setdefault(tv["id"], threading.Lock())
+    with lock:
+        ws = _tv_open(tv)
+        try:
+            mid = "r%d" % int(time.time() * 1000)
+            ws.send({"id": mid, "type": "request", "uri": "ssap://" + uri, "payload": payload or {}})
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                r = ws.recv(max(1.0, deadline - time.time()))
+                if r.get("id") == mid:
+                    if r.get("type") == "error":
+                        raise TVError(r.get("error") or "error")
+                    return r.get("payload", {})
+            raise TVError("timeout")
+        finally:
+            ws.close()
+
+
+def wake_on_lan(mac):
+    mac = re.sub("[^0-9A-Fa-f]", "", mac or "")
+    if len(mac) != 12:
+        raise TVError(tr("محتاج عنوان MAC بتاع التلفزيون علشان يشتغل من الإطفاء", "The TV's MAC address is needed to turn it on"))
+    pkt = b"\xff" * 6 + bytes.fromhex(mac) * 16
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    targets = {"255.255.255.255"}
+    ip = current_ip()
+    if ip:
+        targets.add(ip.rsplit(".", 1)[0] + ".255")
+    for t in targets:
+        for port in (9, 7):
+            try:
+                u.sendto(pkt, (t, port))
+            except OSError:
+                pass
+    u.close()
+
+
+def tv_find(tv_id):
+    for tv in TVS:
+        if tv["id"] == tv_id:
+            return tv
+    return None
+
+
+def tv_refresh(tv):
+    st = TV_STATE.setdefault(tv["id"], {})
+    try:
+        vol = tv_request(tv, "audio/getVolume")
+        vs = vol.get("volumeStatus", vol)
+        st.update(on=True, error="", volume=vs.get("volume"), muted=vs.get("muteStatus", vs.get("muted")))
+        try:
+            st["app"] = tv_request(tv, "com.webos.applicationManager/getForegroundAppInfo").get("appId", "")
+        except TVError:
+            pass
+        if not st.get("inputs"):
+            try:
+                st["inputs"] = [{"id": d.get("id"), "label": d.get("label") or d.get("id")}
+                                for d in tv_request(tv, "tv/getExternalInputList").get("devices", [])]
+            except TVError:
+                pass
+    except TVError as e:
+        st.update(on=False, error=str(e))
+    st["at"] = time.time()
+
+
+def tv_loop():
+    while True:
+        for tv in list(TVS):
+            if tv.get("key") and not (TV_PAIR["running"] and TV_PAIR["id"] == tv["id"]):
+                tv_refresh(tv)
+        time.sleep(20)
+
+
+def tv_pair_job(tv):
+    TV_PAIR.update(running=True, id=tv["id"], result=None, msg="")
+    try:
+        ws = _tv_open(tv, pair_wait=60)
+        ws.close()
+        arp = {ip: mac for mac, ip in arp_table().items()}
+        if not tv.get("mac") and arp.get(tv["ip"]):
+            tv["mac"] = arp[tv["ip"]]
+        with LOCK:
+            if not tv_find(tv["id"]):
+                TVS.append(tv)
+            save_cfg()
+        TV_PAIR.update(result="ok", msg=tr("التلفزيون اتربط", "TV paired"))
+        event(tr("التلفزيون %s اتربط", "TV %s paired") % tv.get("name", tv["ip"]), "ok")
+        tv_refresh(tv)
+    except Exception as e:
+        TV_PAIR.update(result="error", msg=str(e))
+    finally:
+        TV_PAIR["running"] = False
+
+
+def ssdp_discover_tvs(wait=3.0):
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\n"
+           "ST: urn:lge-com:service:webos-second-screen:1\r\n\r\n").encode()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    s.settimeout(0.5)
+    found = {}
+    try:
+        for _ in range(2):
+            s.sendto(msg, ("239.255.255.250", 1900))
+        end = time.time() + wait
+        while time.time() < end:
+            try:
+                data, addr = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            text = data.decode("utf-8", "ignore")
+            loc = re.search(r"(?im)^location:\s*(\S+)", text)
+            found.setdefault(addr[0], {"ip": addr[0], "name": "LG TV", "location": loc.group(1) if loc else ""})
+    except OSError:
+        pass
+    finally:
+        s.close()
+    for d in found.values():
+        if d["location"]:
+            try:
+                with urllib.request.urlopen(d["location"], timeout=2) as r:
+                    x = r.read(65536).decode("utf-8", "ignore")
+                m = re.search(r"<friendlyName>([^<]+)</friendlyName>", x)
+                if m:
+                    d["name"] = m.group(1)
+            except Exception:
+                pass
+        d["paired"] = any(tv["ip"] == d["ip"] and tv.get("key") for tv in TVS)
+    return list(found.values())
+
+
+# ---------------------------------------------------------------- LG ThinQ (cloud, official ThinQ Connect API)
+THINQ_API_KEY = "v6GFvkweNo7DK7yD3ylIZ9w52aKBU0eJ7wLXkSR3"     # public key shipped in LG's own pythinqconnect
+THINQ_REGIONS = {
+    "kic": "AU BD CN HK ID IN JP KH KR LA LK MM MY NP NZ PH SG TH TW VN",
+    "aic": "AG AR AW BB BO BR BS BZ CA CL CO CR CU DM DO EC GD GT GY HN HT JM KN LC MX NI PA PE PR PY SR SV TT US UY VC VE",
+}
+THINQ = CFG.setdefault("thinq", {})          # {pat, country, client_id}
+THINQ_DEV = {}                                # device_id -> {...}
+THINQ_STATUS = {"error": "", "at": 0, "list_at": 0}
+
+
+class ThinQError(Exception):
+    def __init__(self, code, message):
+        super().__init__("%s (%s)" % (message, code))
+        self.code = code
+
+
+def thinq_region(country):
+    for region, codes in THINQ_REGIONS.items():
+        if country in codes.split():
+            return region
+    return "eic"
+
+
+def thinq_call(method, endpoint, body=None, extra=None, cfg=None):
+    cfg = cfg or THINQ
+    base = os.environ.get("MTTL_THINQ_BASE") or "https://api-%s.lgthinq.com" % thinq_region(cfg["country"])  # env: tests only
+    url = "%s/%s" % (base, endpoint)
+    headers = {
+        "Authorization": "Bearer " + cfg["pat"], "x-country": cfg["country"],
+        "x-message-id": base64.urlsafe_b64encode(os.urandom(16))[:-2].decode(),
+        "x-client-id": cfg["client_id"], "x-api-key": THINQ_API_KEY, "x-service-phase": "OP",
+        "Content-Type": "application/json", **(extra or {})}
+    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
+                                 headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read() or b"{}").get("response")
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read()).get("error", {})
+        except Exception:
+            err = {}
+        raise ThinQError(err.get("code", e.code), err.get("message", str(e))) from None
+    except (urllib.error.URLError, OSError) as e:
+        raise ThinQError("net", tr("مفيش اتصال بسيرفر LG: %s", "Can't reach LG's server: %s") % e) from None
+
+
+def thinq_refresh(full=False):
+    if not THINQ.get("pat"):
+        return
+    try:
+        if full or not THINQ_DEV or time.time() - THINQ_STATUS["list_at"] > 1800:
+            devices = thinq_call("GET", "devices") or []
+            seen = set()
+            for d in devices:
+                did, info = d.get("deviceId"), d.get("deviceInfo", {})
+                if not did:
+                    continue
+                seen.add(did)
+                cur = THINQ_DEV.setdefault(did, {"id": did})
+                cur.update(type=info.get("deviceType", ""), model=info.get("modelName", ""),
+                           alias=info.get("alias") or info.get("modelName") or did[:8])
+                if "profile" not in cur:
+                    try:
+                        cur["profile"] = (thinq_call("GET", "devices/%s/profile" % did) or {}).get("property", {})
+                    except ThinQError as e:
+                        cur["profile"], cur["error"] = {}, str(e)
+            for did in list(THINQ_DEV):
+                if did not in seen:
+                    THINQ_DEV.pop(did)
+            THINQ_STATUS["list_at"] = time.time()
+        for did, cur in list(THINQ_DEV.items()):
+            try:
+                cur["state"] = thinq_call("GET", "devices/%s/state" % did) or {}
+                cur["error"], cur["online"] = "", True
+            except ThinQError as e:
+                cur["error"], cur["online"] = str(e), e.code not in ("1222",)
+                if e.code == "1222":
+                    cur["online"] = False
+        THINQ_STATUS.update(error="", at=time.time())
+    except ThinQError as e:
+        THINQ_STATUS.update(error=str(e), at=time.time())
+
+
+def thinq_loop():
+    while True:
+        try:
+            thinq_refresh()
+        except Exception as e:
+            log("thinq error:", e)
+        time.sleep(60)
+
+
+def _writable(prop):
+    return isinstance(prop, dict) and "w" in (prop.get("mode") or [])
+
+
+def thinq_controls(profile):
+    """Turn a ThinQ profile into a generic list of controls the UI can render."""
+    out = []
+    if not isinstance(profile, dict):
+        return out
+    for res, props in profile.items():
+        unit = None
+        if isinstance(props, list):                       # e.g. temperatureInUnits: one entry per unit
+            props = next((p for p in props if isinstance(p, dict) and p.get("unit") == "C"), None)
+            unit = "C"
+        if not isinstance(props, dict):
+            continue
+        for key, prop in props.items():
+            if not _writable(prop):
+                continue
+            typ, val = prop.get("type"), (prop.get("value") or {}).get("w")
+            c = {"res": res, "key": key, "type": typ, "unit": unit}
+            if typ == "enum" and isinstance(val, list) and val:
+                c["values"] = val
+            elif typ == "range" and isinstance(val, dict):
+                c.update(min=val.get("min"), max=val.get("max"), step=val.get("step") or 1)
+            elif typ == "boolean":
+                pass
+            else:
+                continue
+            out.append(c)
+    return out
+
+
+def thinq_flat_state(state):
+    """Flatten state into [{res, key, value}] (Celsius entry for unit lists, location prefix for lists)."""
+    out = []
+    if not isinstance(state, dict):
+        return out
+    for res, val in state.items():
+        if isinstance(val, list):
+            items = [v for v in val if isinstance(v, dict)]
+            c = next((v for v in items if v.get("unit") == "C"), None)
+            for v in ([c] if c else items):
+                loc = v.get("locationName")
+                for k, x in v.items():
+                    if k not in ("unit", "locationName") and not isinstance(x, (dict, list)):
+                        out.append({"res": res, "key": k, "value": x, "loc": loc})
+        elif isinstance(val, dict):
+            for k, x in val.items():
+                if not isinstance(x, (dict, list)):
+                    out.append({"res": res, "key": k, "value": x})
+    return out
+
+
+def thinq_json():
+    devs = []
+    for d in THINQ_DEV.values():
+        devs.append({"id": d["id"], "type": d.get("type", ""), "model": d.get("model", ""), "alias": d.get("alias", ""),
+                     "online": d.get("online", True), "error": d.get("error", ""),
+                     "state": thinq_flat_state(d.get("state")), "controls": thinq_controls(d.get("profile"))})
+    devs.sort(key=lambda x: x["alias"])
+    return {"configured": bool(THINQ.get("pat")), "country": THINQ.get("country", "EG"),
+            "error": THINQ_STATUS["error"], "at": THINQ_STATUS["at"], "devices": devs}
+
+
+def tvs_json():
+    out = []
+    for tv in TVS:
+        st = TV_STATE.get(tv["id"], {})
+        out.append({"id": tv["id"], "ip": tv["ip"], "mac": tv.get("mac", ""), "name": tv.get("name") or "LG TV",
+                    "model": tv.get("model", ""), "paired": bool(tv.get("key")), "on": st.get("on"),
+                    "volume": st.get("volume"), "muted": st.get("muted"), "app": st.get("app", ""),
+                    "inputs": st.get("inputs", []), "error": st.get("error", "")})
+    return out
+
+
 # ---------------------------------------------------------------- web API
 def state_json():
     now = time.time()
@@ -1221,6 +1674,7 @@ def state_json():
         "is_windows": IS_WIN,
         "auth_enabled": auth_enabled(),
         "lang": CFG.get("lang", "ar"),
+        "lg": {"tvs": tvs_json(), "thinq": thinq_json(), "pair": TV_PAIR},
         "today_wh": round(sum(twh.values()), 1),
         "price_kwh": CFG.get("price_kwh", 0),
         "setup": SETUP,
@@ -1272,6 +1726,8 @@ class Web(BaseHTTPRequestHandler):
             return self._send(401, {"error": "login"})
         if p == "/":
             return self._send(200, page_html().encode("utf-8"), "text/html; charset=utf-8")
+        if p == "/api/lg/discover":
+            return self._send(200, {"tvs": ssdp_discover_tvs()})
         if p == "/api/diag":
             return self._send(200, run_diagnostics())
         if p in ("/api/energy", "/api/energy.xlsx"):
@@ -1384,6 +1840,129 @@ class Web(BaseHTTPRequestHandler):
                         aos.pop(str(n), None)
                     AO_STATE.pop((mac, n), None)
                     save_cfg()
+                return self._send(200, {"ok": True})
+
+            if p == "/api/tv/pair":
+                if TV_PAIR["running"]:
+                    return self._send(409, {"error": tr("فيه ربط شغال بالفعل", "Pairing already in progress")})
+                ip = str(ipaddress.IPv4Address(str(b.get("ip", "")).strip()))
+                tv = next((x for x in TVS if x["ip"] == ip), None) or {
+                    "id": "tv%d" % int(time.time() * 1000), "ip": ip, "name": str(b.get("name") or "LG TV")[:40],
+                    "mac": str(b.get("mac") or "")}
+                threading.Thread(target=tv_pair_job, args=(tv,), daemon=True).start()
+                return self._send(200, {"ok": True, "id": tv["id"]})
+
+            if p == "/api/tv/cmd":
+                tv = tv_find(b.get("id"))
+                if not tv:
+                    return self._send(404, {"error": tr("تلفزيون مش معروف", "Unknown TV")})
+                cmd, val = b.get("cmd"), b.get("value")
+                try:
+                    if cmd == "power_on":
+                        wake_on_lan(tv.get("mac"))
+                    elif cmd == "power_off":
+                        tv_request(tv, "system/turnOff")
+                    elif cmd == "vol_up":
+                        tv_request(tv, "audio/volumeUp")
+                    elif cmd == "vol_down":
+                        tv_request(tv, "audio/volumeDown")
+                    elif cmd == "volume":
+                        tv_request(tv, "audio/setVolume", {"volume": max(0, min(100, int(val)))})
+                    elif cmd == "mute":
+                        tv_request(tv, "audio/setMute", {"mute": bool(val)})
+                    elif cmd == "ch_up":
+                        tv_request(tv, "tv/channelUp")
+                    elif cmd == "ch_down":
+                        tv_request(tv, "tv/channelDown")
+                    elif cmd == "input":
+                        tv_request(tv, "tv/switchInput", {"inputId": str(val)})
+                    elif cmd == "toast":
+                        tv_request(tv, "system.notifications/createToast", {"message": str(val)[:120]})
+                    else:
+                        return self._send(400, {"error": "cmd"})
+                except TVError as e:
+                    return self._send(502, {"error": str(e)})
+                threading.Timer(2.5 if cmd == "power_on" else 0.6, tv_refresh, args=(tv,)).start()
+                return self._send(200, {"ok": True})
+
+            if p == "/api/tv/update":
+                tv = tv_find(b.get("id"))
+                if not tv:
+                    return self._send(404, {"error": tr("تلفزيون مش معروف", "Unknown TV")})
+                with LOCK:
+                    if "name" in b:
+                        tv["name"] = str(b["name"]).strip()[:40] or "LG TV"
+                    if "mac" in b:
+                        mac = re.sub("[^0-9A-Fa-f]", "", str(b["mac"]))
+                        if mac and len(mac) != 12:
+                            return self._send(400, {"error": tr("عنوان MAC لازم 12 حرف/رقم", "MAC must be 12 hex digits")})
+                        tv["mac"] = mac.upper()
+                    save_cfg()
+                return self._send(200, {"ok": True})
+
+            if p == "/api/tv/remove":
+                with LOCK:
+                    TVS[:] = [x for x in TVS if x["id"] != b.get("id")]
+                    TV_STATE.pop(b.get("id"), None)
+                    save_cfg()
+                return self._send(200, {"ok": True})
+
+            if p == "/api/thinq/connect":
+                pat = str(b.get("pat", "")).strip()
+                country = str(b.get("country", "EG")).strip().upper()[:2]
+                if len(pat) < 20 or not re.fullmatch("[A-Z]{2}", country):
+                    return self._send(400, {"error": tr("اكتب التوكن كامل وكود الدولة (حرفين، مثلاً EG)",
+                                                        "Paste the full token and a 2-letter country code (e.g. EG)")})
+                cfg = {"pat": pat, "country": country, "client_id": THINQ.get("client_id") or str(uuid.uuid4())}
+                try:
+                    devices = thinq_call("GET", "devices", cfg=cfg) or []
+                except ThinQError as e:
+                    return self._send(400, {"error": tr("LG رفضت التوكن: %s", "LG rejected the token: %s") % e})
+                with LOCK:
+                    THINQ.clear()
+                    THINQ.update(cfg)
+                    THINQ_DEV.clear()
+                    save_cfg()
+                threading.Thread(target=thinq_refresh, kwargs={"full": True}, daemon=True).start()
+                event(tr("اتربط حساب LG ThinQ (%d جهاز)", "LG ThinQ connected (%d devices)") % len(devices), "ok")
+                return self._send(200, {"ok": True, "count": len(devices)})
+
+            if p == "/api/thinq/disconnect":
+                with LOCK:
+                    THINQ.clear()
+                    THINQ_DEV.clear()
+                    THINQ_STATUS.update(error="", at=0, list_at=0)
+                    save_cfg()
+                return self._send(200, {"ok": True})
+
+            if p == "/api/thinq/refresh":
+                threading.Thread(target=thinq_refresh, kwargs={"full": True}, daemon=True).start()
+                return self._send(200, {"ok": True})
+
+            if p == "/api/thinq/control":
+                did = str(b.get("id", ""))
+                dev = THINQ_DEV.get(did)
+                if not dev:
+                    return self._send(404, {"error": tr("جهاز مش معروف", "Unknown device")})
+                ok = [c for c in thinq_controls(dev.get("profile")) if c["res"] == b.get("res") and c["key"] == b.get("key")]
+                if not ok:
+                    return self._send(400, {"error": tr("الجهاز ده مش بيقبل الأمر ده", "This device doesn't accept that command")})
+                c, val = ok[0], b.get("value")
+                if c["type"] == "range":
+                    val = float(val)
+                    val = int(val) if val == int(val) else val
+                elif c["type"] == "boolean":
+                    val = bool(val)
+                elif val not in c.get("values", []):
+                    return self._send(400, {"error": tr("قيمة مش مسموحة", "Value not allowed")})
+                body = {c["res"]: {c["key"]: val}}
+                if c.get("unit"):
+                    body[c["res"]]["unit"] = c["unit"]
+                try:
+                    thinq_call("POST", "devices/%s/control" % did, body, extra={"x-conditional-control": "true"})
+                except ThinQError as e:
+                    return self._send(502, {"error": str(e)})
+                threading.Timer(1.5, thinq_refresh).start()
                 return self._send(200, {"ok": True})
 
             if p == "/api/group":
@@ -1810,6 +2389,51 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .ap:hover{background:#ffffff05}
 .ap.sel{background:var(--copper-d)}
 .ap.dim{opacity:.45}
+/* ---------- LG ---------- */
+.lg-h{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:28px 0 12px;flex-wrap:wrap}
+.lg-h h2{margin:0;font-size:18px;font-weight:600;display:flex;align-items:center;gap:10px}
+.lg-badge{font-size:11px;font-weight:700;letter-spacing:.02em;color:#1d1408;background:var(--copper);border-radius:6px;padding:2px 6px}
+.lg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.dev{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);padding:16px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.dev.on{border-color:#3ddc9744}
+.dev-h{display:flex;align-items:center;gap:12px}
+.dev-h .ico{width:44px;height:44px;border-radius:13px;background:var(--raise);display:grid;place-items:center;color:var(--muted);flex:none}
+.dev.on .dev-h .ico{background:var(--on-d);color:var(--on)}
+.dev-h .tx{min-width:0;flex:1}
+.dev-h .tx b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dev-h .tx small{color:var(--muted);font-size:12.5px}
+.dev .pilot{flex:none}
+.dev.on .pilot{background:var(--on-d);border-color:#3ddc9766}
+.dev.on .pilot::after{inset-inline-start:28px;background:var(--on);box-shadow:0 0 12px #3ddc97aa}
+.dev.off .pilot{border-color:#f06a6a66}
+.dev.off .pilot::after{background:var(--off);box-shadow:0 0 10px #f06a6a66}
+.facts{display:flex;flex-wrap:wrap;gap:6px}
+.fact{background:var(--raise);border-radius:10px;padding:7px 10px;min-width:0}
+.fact small{display:block;color:var(--muted);font-size:11.5px}
+.fact b{font-weight:500;font-size:14px}
+.ctl{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13.5px}
+.ctl>span{color:var(--muted)}
+.stepper{display:flex;align-items:center;gap:4px;background:var(--raise);border-radius:11px;padding:3px}
+.stepper button{width:32px;height:30px;border:0;border-radius:8px;background:transparent;color:var(--text);font-size:17px;display:grid;place-items:center}
+.stepper button:hover:not(:disabled){background:var(--raise2)}
+.stepper b{min-width:54px;text-align:center;font-weight:500}
+.sel{background:var(--raise);border:1px solid var(--line);border-radius:10px;padding:6px 10px;color:var(--text);font-size:13.5px;max-width:60%}
+.tv-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tv-row .ibtn{padding:7px 10px}
+.dev details{font-size:13px;color:var(--muted)}
+.dev details summary{cursor:pointer;font-size:12.5px}
+.dev details .kv{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-top:1px solid var(--line)}
+.dev details .kv b{color:var(--text);font-weight:500;text-align:end}
+.dev-err{font-size:12.5px;color:#ffb0b0;background:var(--off-d);border-radius:9px;padding:7px 10px}
+.found{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;background:var(--raise);border-radius:12px;margin-top:8px}
+.found b{font-weight:500}
+.found small{color:var(--muted);display:block;font-size:12px}
+.lg-sub{border-top:1px solid var(--line);margin-top:18px;padding-top:16px}
+.lg-sub h3{margin:0 0 4px;font-size:15px;font-weight:600}
+.inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.inline input{flex:1;min-width:140px}
+.pairbox{margin-top:10px;padding:12px 14px;border-radius:12px;background:var(--copper-d);color:#f2c48a;font-size:13.5px;line-height:1.7}
+.pairbox.ok{background:var(--on-d);color:#a9ecd0}.pairbox.err{background:var(--off-d);color:#ffb0b0}
 .price input{width:110px}
 .ap{display:grid;grid-template-columns:40px minmax(0,1fr) auto;gap:14px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}
 .ap:first-of-type{border-top:0}
@@ -1902,6 +2526,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
       <div id="summary"></div>
       <div class="toolbar" id="toolbar"></div>
       <div id="devices"></div>
+      <div id="lg-home"></div>
     </section>
 
     <section id="v-sched" class="view">
@@ -1971,6 +2596,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
           <div id="diag"></div>
         </div>
         <div>
+          <div class="panel" id="lg-set"></div>
           <div class="panel">
             <h2 data-t="pwTitle"></h2>
             <p class="lead" id="pw-state"></p>
@@ -2161,6 +2787,17 @@ ar:{
  pwConfirmOff:'تلغي كلمة السر؟ أي حد على الشبكة هيقدر يتحكم.',pwForgot:'لو نسيت كلمة السر: اقفل البرنامج، وافتح <code>mttl.db</code> بأي برنامج SQLite، وامسح صف <code>auth</code> من جدول <code>settings</code>.',
  aoTitle:'اطفي لوحدها لما الشحن يخلص',aoLead:'للشواحن: لما الموبايل أو اللاب يوصل 100% السحب بيقع. لو فضل أقل من الحد ده المدة دي، الفيشة تفصل. بتشتغل بس بعد ما الشحن يبدأ فعلاً.',
  aoW:'وات (الحد)',aoMin:'دقيقة',aoWatch:'هتفصل لما الشحن يخلص',aoWait:'مستني الشحن يبدأ',aoCount:'الشحن خلص — هتفصل بعد {0}',
+ lgTitle:'أجهزة LG',lgSet:'ربط أجهزة LG',lgSetLead:'التلفزيون بيتربط على شبكة البيت مباشرة. التكييف والغسالة والتلاجة بيتربطوا بحساب LG ThinQ بتاعك.',
+ tvSec:'التلفزيون (webOS)',tvSecLead:'التلفزيون لازم يكون شغال وعلى نفس الشبكة. أول مرة هيظهر على الشاشة طلب اتصال، دوس قبول بالريموت.',
+ findTv:'دوّر على التلفزيون',searching:'بدوّر…',noTvFound:'ما لقيتش تلفزيون. اتأكد إنه شغال، أو اكتب عنوانه تحت.',pair:'اربط',paired:'مربوط',tvIp:'عنوان التلفزيون (IP)',
+ pairing:'بص على شاشة التلفزيون ودوس "قبول" بالريموت… (عندك دقيقة)',pairOk:'التلفزيون اتربط.',tvMac:'عنوان MAC (للتشغيل من الإطفاء)',macHint:'علشان التلفزيون يشتغل من الإطفاء: فعّل في إعداداته "التشغيل عن طريق Wi-Fi / LAN" (Turn on via Wi-Fi). البرنامج بيجيب الـ MAC لوحده لو قدر.',
+ removeTv:'شيل التلفزيون',confirmRemoveTv:'تشيل التلفزيون ده؟',tvOn:'شغال',tvOff:'مقفول',tvUnknown:'مش معروف',noMac:'محتاج MAC علشان يشتغل من الإطفاء',
+ volume:'الصوت',mute:'كتم',unmute:'شغّل الصوت',channel:'القناة',input:'المصدر',chooseInput:'اختار المصدر',nowApp:'شغال دلوقتي: {0}',
+ thinqSec:'التكييف والغسالة والتلاجة (LG ThinQ)',thinqLead:'بيشتغل بحساب LG ThinQ بتاعك عن طريق API رسمي من LG. الأجهزة لازم تكون متضافة على تطبيق ThinQ الأول.',
+ thinqSteps:'1. افتح <a href="https://connect-pat.lgthinq.com" target="_blank" rel="noopener">connect-pat.lgthinq.com</a> وادخل بحساب ThinQ.<br>2. دوس <b>ADD NEW TOKEN</b>، اكتب أي اسم، وعلّم على كل الصلاحيات.<br>3. دوس <b>CREATE TOKEN</b> وانسخ التوكن وحطه هنا.',
+ pat:'التوكن (Personal Access Token)',country:'الدولة',connect:'اربط',connecting:'بتصل…',disconnect:'افصل',refreshNow:'حدّث',
+ thinqOk:'متصل — {0} جهاز',thinqNone:'مش متصل',thinqErr:'آخر خطأ: {0}',confirmDisc:'تفصل حساب LG ThinQ؟',
+ devOffline:'الجهاز مش متصل بالإنترنت',allReadings:'كل القراءات',remain:'الوقت الباقي',
  langTitle:'اللغة',langLead:'لغة البرنامج والرسايل والسجل.',error:'حصل خطأ',
  types:{tv:'تلفزيون',heater:'سخان',ac:'تكييف',fridge:'تلاجة',washer:'غسالة',kettle:'غلاية',lamp:'إضاءة',fan:'مروحة',router:'راوتر',charger:'شاحن',pc:'كمبيوتر',pump:'موتور مياه',other:'تاني'},
  rooms:['الصالة','المطبخ','أوضة النوم','أوضة الأطفال','الحمام','المكتب','البلكونة'],
@@ -2218,6 +2855,17 @@ en:{
  pwConfirmOff:'Remove the password? Anyone on your network will be able to control the strips.',pwForgot:'Forgot it? Close the app, open <code>mttl.db</code> in any SQLite tool, and delete the <code>auth</code> row from the <code>settings</code> table.',
  aoTitle:'Turn off when charging is done',aoLead:'For chargers: when a phone or laptop reaches 100% the draw drops. If it stays below this limit for this long, the outlet switches off. It only arms after charging has actually started.',
  aoW:'W (limit)',aoMin:'minutes',aoWatch:'Turns off when charging is done',aoWait:'Waiting for charging to start',aoCount:'Charging done — off in {0}',
+ lgTitle:'LG devices',lgSet:'Connect LG devices',lgSetLead:'The TV connects directly over your home network. Air conditioners, washers and fridges connect through your LG ThinQ account.',
+ tvSec:'TV (webOS)',tvSecLead:'The TV must be on and on the same network. The first time, a connection request appears on screen — accept it with the remote.',
+ findTv:'Find TV',searching:'Searching…',noTvFound:'No TV found. Make sure it\'s on, or type its address below.',pair:'Pair',paired:'Paired',tvIp:'TV address (IP)',
+ pairing:'Look at the TV and press "Accept" on the remote… (you have a minute)',pairOk:'TV paired.',tvMac:'MAC address (to turn on from off)',macHint:'To turn the TV on from off, enable "Turn on via Wi-Fi / LAN" in its settings. The app fills the MAC in automatically when it can.',
+ removeTv:'Remove TV',confirmRemoveTv:'Remove this TV?',tvOn:'On',tvOff:'Off',tvUnknown:'Unknown',noMac:'Needs a MAC address to turn on',
+ volume:'Volume',mute:'Mute',unmute:'Unmute',channel:'Channel',input:'Input',chooseInput:'Choose input',nowApp:'Now playing: {0}',
+ thinqSec:'Air con, washer and fridge (LG ThinQ)',thinqLead:'Works with your LG ThinQ account through LG\'s official API. Devices must already be added in the ThinQ app.',
+ thinqSteps:'1. Open <a href="https://connect-pat.lgthinq.com" target="_blank" rel="noopener">connect-pat.lgthinq.com</a> and sign in with ThinQ.<br>2. Press <b>ADD NEW TOKEN</b>, give it any name, and tick all permissions.<br>3. Press <b>CREATE TOKEN</b>, copy the token and paste it here.',
+ pat:'Token (Personal Access Token)',country:'Country',connect:'Connect',connecting:'Connecting…',disconnect:'Disconnect',refreshNow:'Refresh',
+ thinqOk:'Connected — {0} devices',thinqNone:'Not connected',thinqErr:'Last error: {0}',confirmDisc:'Disconnect your LG ThinQ account?',
+ devOffline:'Device is offline',allReadings:'All readings',remain:'Time left',
  langTitle:'Language',langLead:'Language for the app, messages and activity log.',error:'Something went wrong',
  types:{tv:'TV',heater:'Water heater',ac:'Air con',fridge:'Fridge',washer:'Washer',kettle:'Kettle',lamp:'Lights',fan:'Fan',router:'Router',charger:'Charger',pc:'Computer',pump:'Water pump',other:'Other'},
  rooms:['Living room','Kitchen','Bedroom','Kids room','Bathroom','Office','Balcony'],
@@ -2287,7 +2935,7 @@ async function refresh(){
   else w.style.display='none';
   render();renderLog();
 }
-function render(){if(!S||editing)return;if(curTab==='home')renderHome();if(curTab==='sched')renderSched();if(curTab==='energy'&&Date.now()-EN_AT>60000&&(EN.mode!=='custom'))loadEnergy()}
+function render(){if(!S||editing)return;if(curTab==='home'){renderHome();renderLG()}if(curTab==='settings')renderLGSettings();if(curTab==='sched')renderSched();if(curTab==='energy'&&Date.now()-EN_AT>60000&&(EN.mode!=='custom'))loadEnergy()}
 
 /* ---------------- home ---------------- */
 let VIEW=(()=>{try{return localStorage.getItem('mttl_view')||'strip'}catch(e){return 'strip'}})();
@@ -2535,6 +3183,104 @@ function drawEnergy(){
 }
 async function savePrice(){try{await api('/api/price',{price:+$('en-price').value||0});toast(t('savedPrice'));await refresh();loadEnergy()}catch(e){toast(e.message,1)}}
 
+/* ---------------- LG ---------------- */
+const LGT={
+ ar:{types:{DEVICE_AIR_CONDITIONER:'تكييف',DEVICE_WASHER:'غسالة',DEVICE_DRYER:'نشافة',DEVICE_REFRIGERATOR:'تلاجة',DEVICE_AIR_PURIFIER:'منقي هوا',DEVICE_DISH_WASHER:'غسالة أطباق',DEVICE_WATER_HEATER:'سخان',DEVICE_OVEN:'فرن',DEVICE_MICROWAVE_OVEN:'ميكروويف',DEVICE_DEHUMIDIFIER:'مزيل رطوبة',DEVICE_HUMIDIFIER:'مرطب هوا',DEVICE_ROBOT_CLEANER:'مكنسة روبوت',DEVICE_STYLER:'ستايلر',DEVICE_WASHTOWER:'واش تاور',DEVICE_CEILING_FAN:'مروحة سقف',DEVICE_WATER_PURIFIER:'فلتر مياه'},
+  keys:{airConOperationMode:'التشغيل',airPurifierOperationMode:'التشغيل',airCleanOperationMode:'تنقية الهوا',currentJobMode:'الوضع',targetTemperature:'الحرارة المطلوبة',currentTemperature:'الحرارة دلوقتي',coolTargetTemperature:'حرارة التبريد',heatTargetTemperature:'حرارة التدفئة',windStrength:'سرعة الهوا',windStep:'سرعة الهوا',currentState:'الحالة',washerOperationMode:'أمر الغسالة',dryerOperationMode:'أمر النشافة',powerSaveEnabled:'توفير الطاقة',doorState:'الباب',humidity:'الرطوبة',expressMode:'تبريد سريع',rapidFreeze:'تجميد سريع',remoteControlEnabled:'التحكم عن بعد',rotateUpDown:'تحريك فوق وتحت',rotateLeftRight:'تحريك يمين وشمال',light:'النور',display:'الشاشة',totalHour:'إجمالي الساعات',totalMinute:'إجمالي الدقايق',remainHour:'ساعات باقية',remainMinute:'دقايق باقية',cycleCount:'عدد الدورات',PM1:'PM1',PM2:'PM2.5',PM10:'PM10',totalPollutionLevel:'جودة الهوا',filterRemainPercent:'عمر الفلتر'},
+  vals:{POWER_ON:'شغال',POWER_OFF:'مقفول',COOL:'تبريد',HEAT:'تدفئة',FAN:'مروحة',AUTO:'تلقائي',AIR_DRY:'تجفيف',AIR_CLEAN:'تنقية',ENERGY_SAVING:'توفير',LOW:'هادي',MID:'متوسط',HIGH:'عالي',SLOW:'بطيء',FAST:'سريع',POWER:'قوي',NATURE:'طبيعي',RUNNING:'شغالة',END:'خلصت',PAUSE:'واقفة مؤقتاً',INITIAL:'جاهزة',DETECTING:'بتقيس الحمولة',RINSING:'شطف',SPINNING:'عصر',DRYING:'تجفيف',COOLING:'تبريد',RESERVED:'متأجلة',SLEEP:'نوم',ERROR:'عطل',START:'ابدأ',STOP:'وقف',WAKE_UP:'صحّي',OPEN:'مفتوح',CLOSE:'مقفول',GOOD:'كويس',NORMAL:'عادي',BAD:'وحش',VERY_BAD:'وحش جداً',true:'شغال',false:'مقفول'}},
+ en:{types:{DEVICE_AIR_CONDITIONER:'Air conditioner',DEVICE_WASHER:'Washer',DEVICE_DRYER:'Dryer',DEVICE_REFRIGERATOR:'Fridge',DEVICE_AIR_PURIFIER:'Air purifier',DEVICE_DISH_WASHER:'Dishwasher',DEVICE_WATER_HEATER:'Water heater',DEVICE_OVEN:'Oven',DEVICE_MICROWAVE_OVEN:'Microwave',DEVICE_DEHUMIDIFIER:'Dehumidifier',DEVICE_HUMIDIFIER:'Humidifier',DEVICE_ROBOT_CLEANER:'Robot vacuum',DEVICE_STYLER:'Styler',DEVICE_WASHTOWER:'WashTower',DEVICE_CEILING_FAN:'Ceiling fan',DEVICE_WATER_PURIFIER:'Water purifier'},
+  keys:{airConOperationMode:'Power',airPurifierOperationMode:'Power',airCleanOperationMode:'Air cleaning',currentJobMode:'Mode',targetTemperature:'Target temperature',currentTemperature:'Current temperature',coolTargetTemperature:'Cooling target',heatTargetTemperature:'Heating target',windStrength:'Fan speed',windStep:'Fan speed',currentState:'Status',washerOperationMode:'Washer command',dryerOperationMode:'Dryer command',powerSaveEnabled:'Power save',doorState:'Door',humidity:'Humidity',expressMode:'Express cool',rapidFreeze:'Rapid freeze',remoteControlEnabled:'Remote control',rotateUpDown:'Swing up/down',rotateLeftRight:'Swing left/right',light:'Light',display:'Display',remainHour:'Hours left',remainMinute:'Minutes left',cycleCount:'Cycles',totalPollutionLevel:'Air quality',filterRemainPercent:'Filter life'},
+  vals:{POWER_ON:'On',POWER_OFF:'Off',COOL:'Cool',HEAT:'Heat',FAN:'Fan',AUTO:'Auto',AIR_DRY:'Dry',AIR_CLEAN:'Clean',ENERGY_SAVING:'Eco',LOW:'Low',MID:'Medium',HIGH:'High',RUNNING:'Running',END:'Finished',PAUSE:'Paused',INITIAL:'Ready',DETECTING:'Detecting load',RINSING:'Rinsing',SPINNING:'Spinning',DRYING:'Drying',COOLING:'Cooling',RESERVED:'Delayed start',ERROR:'Error',START:'Start',STOP:'Stop',WAKE_UP:'Wake up',OPEN:'Open',CLOSE:'Closed',true:'On',false:'Off'}}};
+const LGCMD={ar:{POWER_OFF:'اقفل',POWER_ON:'شغّل',START:'ابدأ',STOP:'وقّف',WAKE_UP:'صحّي'},en:{POWER_OFF:'Power off',POWER_ON:'Power on',START:'Start',STOP:'Stop',WAKE_UP:'Wake up'}};
+const lgCmdLabel=v=>LGCMD[LANG][v]||lgVal(v);
+const pretty=s=>String(s).replace(/_/g,' ').toLowerCase().replace(/(^|\s)\S/g,c=>c.toUpperCase());
+const lgKey=k=>LGT[LANG].keys[k]||pretty(k.replace(/([a-z])([A-Z])/g,'$1 $2'));
+const lgVal=v=>LGT[LANG].vals[String(v)]??(typeof v==='number'?v:pretty(v));
+const lgType=t_=>LGT[LANG].types[t_]||pretty(String(t_).replace('DEVICE_',''));
+function lgIcon(t_){t_=t_||'';return t_.includes('AIR_CONDITIONER')?'ac':/WASH|DRYER|STYLER/.test(t_)?'washer':/REFRIGERATOR|WINE|KIMCHI/.test(t_)?'fridge':/PURIFIER|FAN|HUMIDIFIER|VENTILATOR/.test(t_)?'fan':/HEATER|BOILER/.test(t_)?'heater':/OVEN|COOK|HOOD|BREW/.test(t_)?'kettle':'other'}
+const stVal=(d,res,key)=>{const x=d.state.find(s_=>s_.res===res&&s_.key===key)||d.state.find(s_=>s_.key===key);return x?x.value:undefined};
+
+function tvCard(tv){
+  const st=tv.on===true?'on':tv.on===false?'off':'';
+  return `<div class="dev ${st}"><div class="dev-h"><div class="ico">${tIco('tv',22)}</div>
+    <div class="tx"><b>${esc(tv.name)}</b><small>${tv.on?t('tvOn'):tv.on===false?t('tvOff'):t('tvUnknown')}${tv.model?t('sep')+esc(tv.model):''}</small></div>
+    <button class="pilot" aria-pressed="${!!tv.on}" aria-label="${esc(tv.name)}" ${!tv.on&&!tv.mac?'disabled title="'+t('noMac')+'"':''} onclick="tvCmd('${tv.id}','${tv.on?'power_off':'power_on'}')"></button></div>
+    ${tv.on?`<div class="ctl"><span>${t('volume')}</span><div class="stepper"><button onclick="tvCmd('${tv.id}','vol_down')" aria-label="-">−</button><b class="ltr">${tv.muted?'🔇':tv.volume??'—'}</b><button onclick="tvCmd('${tv.id}','vol_up')" aria-label="+">+</button></div></div>
+      <div class="ctl"><span>${t('channel')}</span><div class="stepper"><button onclick="tvCmd('${tv.id}','ch_down')" aria-label="-">−</button><b>${sv('<rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 3l4 4 4-4"/>',16)}</b><button onclick="tvCmd('${tv.id}','ch_up')" aria-label="+">+</button></div></div>
+      <div class="tv-row"><button class="ibtn" onclick="tvCmd('${tv.id}','mute',${!tv.muted})">${tv.muted?t('unmute'):t('mute')}</button>
+        ${tv.inputs.length?`<select class="sel" onchange="if(this.value)tvCmd('${tv.id}','input',this.value)"><option value="">${t('chooseInput')}</option>${tv.inputs.map(i=>`<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`:''}</div>
+      ${tv.app?`<div class="hint" style="margin:0">${t('nowApp',esc(tv.app.replace(/^com\.webos\.app\./,'')))}</div>`:''}`
+    :(!tv.mac?`<div class="hint" style="margin:0">${t('noMac')}</div>`:'')}
+  </div>`;
+}
+function thinqCard(d){
+  const power=d.controls.find(c=>c.type==='enum'&&c.values.includes('POWER_ON')&&c.values.includes('POWER_OFF'));
+  const pv=power?stVal(d,power.res,power.key):undefined, isOn=pv==='POWER_ON';
+  const facts=[];
+  const ctlKeys=new Set(d.controls.map(c=>c.key));
+  ['currentState','currentTemperature','targetTemperature','currentJobMode','humidity'].forEach(k=>{const v=stVal(d,null,k);if(v!==undefined&&v!==null&&!ctlKeys.has(k))facts.push([k,v])});
+  const rh=stVal(d,null,'remainHour'),rm=stVal(d,null,'remainMinute');
+  if(rh!==undefined||rm!==undefined)facts.push(['remain',(rh||0)+':'+two(rm||0)]);
+  const ctls=d.controls.filter(c=>c!==power).map(c=>{const cur=stVal(d,c.res,c.key);const id=`'${d.id}','${c.res}','${c.key}'`;
+    if(c.type==='range'){const v=+(cur??c.min);return `<div class="ctl"><span>${lgKey(c.key)}</span><div class="stepper"><button ${v<=c.min?'disabled':''} onclick="lgCtl(${id},${v-c.step})" aria-label="-">−</button><b class="ltr">${cur??'—'}${/emperature/i.test(c.key)?'°':''}</b><button ${v>=c.max?'disabled':''} onclick="lgCtl(${id},${v+c.step})" aria-label="+">+</button></div></div>`}
+    if(c.type==='enum'&&cur===undefined&&c.values.length<=4)return `<div class="ctl"><span>${lgKey(c.key)}</span><div class="tv-row">${c.values.map(v=>`<button class="ibtn" ${d.online?'':'disabled'} onclick="lgCtl(${id},'${esc(v)}')">${esc(lgCmdLabel(v))}</button>`).join('')}</div></div>`;
+    if(c.type==='boolean')return `<div class="ctl"><span>${lgKey(c.key)}</span><label class="switch"><input type="checkbox" ${cur?'checked':''} onchange="lgCtl(${id},this.checked)"><span></span></label></div>`;
+    return `<div class="ctl"><span>${lgKey(c.key)}</span><select class="sel" onchange="lgCtl(${id},this.value)">${cur===undefined?'<option></option>':''}${c.values.map(v=>`<option value="${esc(v)}" ${v===cur?'selected':''}>${esc(lgVal(v))}</option>`).join('')}</select></div>`}).join('');
+  return `<div class="dev ${power?(isOn?'on':'off'):''}"><div class="dev-h"><div class="ico">${tIco(lgIcon(d.type),22)}</div>
+    <div class="tx"><b>${esc(d.alias)}</b><small>${esc(lgType(d.type))}${d.model?t('sep')+esc(d.model):''}</small></div>
+    ${power?`<button class="pilot" aria-pressed="${isOn}" ${d.online?'':'disabled'} onclick="lgCtl('${d.id}','${power.res}','${power.key}','${isOn?'POWER_OFF':'POWER_ON'}')"></button>`:''}</div>
+    ${!d.online?`<div class="dev-err">${t('devOffline')}</div>`:d.error?`<div class="dev-err">${esc(d.error)}</div>`:''}
+    ${facts.length?`<div class="facts">${facts.map(([k,v])=>`<div class="fact"><small>${k==='remain'?t('remain'):lgKey(k)}</small><b>${esc(lgVal(v))}${/emperature/i.test(k)?'°':''}</b></div>`).join('')}</div>`:''}
+    ${ctls}
+    ${d.state.length?`<details><summary>${t('allReadings')}</summary>${d.state.map(x=>`<div class="kv"><span>${x.loc?esc(pretty(x.loc))+' — ':''}${esc(lgKey(x.key))}</span><b>${esc(lgVal(x.value))}</b></div>`).join('')}</details>`:''}
+  </div>`;
+}
+function renderLG(){
+  const L=S.lg,box=$('lg-home');if(!box)return;
+  const tvs=L.tvs.filter(x=>x.paired),devs=L.thinq.devices;
+  box.innerHTML=(tvs.length||devs.length)?`<div class="lg-h"><h2><span class="lg-badge">LG</span>${t('lgTitle')}</h2><button class="btn ghost sm" onclick="tab('settings')">${t('lgSet')}</button></div>
+    <div class="lg-grid">${tvs.map(tvCard).join('')}${devs.map(thinqCard).join('')}</div>`:'';
+}
+async function tvCmd(id,cmd,value){try{await api('/api/tv/cmd',{id,cmd,value})}catch(e){toast(e.message,1)}setTimeout(refresh,cmd==='power_on'?3000:900)}
+async function lgCtl(id,res,key,value){try{await api('/api/thinq/control',{id,res,key,value});toast(t('done'))}catch(e){toast(e.message,1)}setTimeout(refresh,2500)}
+
+let FOUND=null,THQ_BUSY=false;
+function renderLGSettings(){
+  const box=$('lg-set');if(!box||!S)return;
+  if(box.contains(document.activeElement)&&document.activeElement.tagName==='INPUT')return;
+  const L=S.lg,P_=L.pair,Q=L.thinq;
+  let pairMsg='';
+  if(P_.running)pairMsg=`<div class="pairbox">${t('pairing')}</div>`;
+  else if(P_.result==='ok')pairMsg=`<div class="pairbox ok">${t('pairOk')}</div>`;
+  else if(P_.result==='error')pairMsg=`<div class="pairbox err">${esc(P_.msg)}</div>`;
+  box.innerHTML=`<h2><span class="lg-badge">LG</span> ${t('lgSet')}</h2><p class="lead">${t('lgSetLead')}</p>
+   <div class="lg-sub" style="border:0;margin:0;padding:0"><h3>${t('tvSec')}</h3><p class="hint" style="margin:0 0 10px">${t('tvSecLead')}</p>
+    <button class="btn sm" id="find-tv" onclick="findTv()">${FOUND===false?t('searching'):t('findTv')}</button>
+    <div id="tv-found">${Array.isArray(FOUND)?(FOUND.length?FOUND.map(f=>`<div class="found"><div><b>${esc(f.name)}</b><small class="ltr">${esc(f.ip)}</small></div>${f.paired?`<span class="pill ok"><i></i>${t('paired')}</span>`:`<button class="btn primary sm" ${P_.running?'disabled':''} onclick="pairTv('${esc(f.ip)}','${esc(f.name)}')">${t('pair')}</button>`}</div>`).join(''):`<p class="hint">${t('noTvFound')}</p>`):''}</div>
+    <label class="f">${t('tvIp')}</label><div class="inline"><input type="text" id="tv-ip" class="ltr" placeholder="192.168.1.20"><button class="btn sm" ${P_.running?'disabled':''} onclick="pairTv($('tv-ip').value.trim(),'LG TV')">${t('pair')}</button></div>
+    ${pairMsg}
+    ${L.tvs.map(tv=>`<div class="found" style="display:block"><div class="inline"><input type="text" value="${esc(tv.name)}" onchange="tvUpd('${tv.id}',{name:this.value})"><span class="pill ${tv.on?'ok':''}"><i></i>${tv.paired?(tv.on?t('tvOn'):tv.on===false?t('tvOff'):t('paired')):'—'}</span><button class="link" onclick="tvRemove('${tv.id}')">${t('removeTv')}</button></div>
+      <label class="f" style="margin-top:10px">${t('tvMac')}</label><input type="text" class="ltr" value="${esc(tv.mac)}" placeholder="A1B2C3D4E5F6" onchange="tvUpd('${tv.id}',{mac:this.value})">
+      <p class="hint">${t('macHint')}</p></div>`).join('')}
+   </div>
+   <div class="lg-sub"><h3>${t('thinqSec')}</h3><p class="hint" style="margin:0 0 8px">${t('thinqLead')}</p>
+    ${Q.configured?`<div class="inline"><span class="pill ok"><i></i>${t('thinqOk',Q.devices.length)}</span><button class="btn ghost sm" onclick="thinqRefresh()">${t('refreshNow')}</button><button class="btn ghost sm danger" onclick="thinqDisc()">${t('disconnect')}</button></div>${Q.error?`<p class="hint" style="color:#ffb0b0">${t('thinqErr',esc(Q.error))}</p>`:''}`
+     :`<p class="hint" style="margin:0 0 6px;line-height:1.9">${t('thinqSteps')}</p>
+      <label class="f">${t('pat')}</label><input type="password" id="thq-pat" autocomplete="off">
+      <label class="f">${t('country')}</label><div class="inline"><input type="text" id="thq-c" class="ltr" value="${esc(Q.country||'EG')}" maxlength="2" style="max-width:80px;flex:none"><button class="btn primary sm" id="thq-go" onclick="thinqConnect()">${THQ_BUSY?t('connecting'):t('connect')}</button></div>
+      <div class="err" id="thq-err"></div>`}
+   </div>`;
+}
+async function findTv(){FOUND=false;renderLGSettings();try{FOUND=(await getJSON('/api/lg/discover')).tvs}catch(e){FOUND=[]}renderLGSettings()}
+async function pairTv(ip,name){if(!ip)return;try{await api('/api/tv/pair',{ip,name})}catch(e){toast(e.message,1)}setTimeout(refresh,400)}
+async function tvUpd(id,obj){try{await api('/api/tv/update',{id,...obj})}catch(e){toast(e.message,1)}refresh()}
+async function tvRemove(id){if(!confirm(t('confirmRemoveTv')))return;try{await api('/api/tv/remove',{id})}catch(e){toast(e.message,1)}refresh()}
+async function thinqConnect(){THQ_BUSY=true;$('thq-go').textContent=t('connecting');$('thq-err').textContent='';
+  try{const r=await api('/api/thinq/connect',{pat:$('thq-pat').value,country:$('thq-c').value});toast(t('thinqOk',r.count));THQ_BUSY=false;await refresh()}
+  catch(e){THQ_BUSY=false;$('thq-go').textContent=t('connect');$('thq-err').textContent=e.message}}
+async function thinqDisc(){if(!confirm(t('confirmDisc')))return;await api('/api/thinq/disconnect',{});refresh()}
+async function thinqRefresh(){await api('/api/thinq/refresh',{});toast(t('done'));setTimeout(refresh,3000)}
+
 /* ---------------- setup ---------------- */
 async function loadWifi(){
   try{const w=await getJSON('/api/wifi'),onSetup=/^T?ONLY_TAP_/i.test(w.current_ssid||'');
@@ -2644,6 +3390,8 @@ def main():
     threading.Thread(target=dev.serve_forever, daemon=True).start()
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=tv_loop, daemon=True).start()
+    threading.Thread(target=thinq_loop, daemon=True).start()
     try:
         web = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Web)
     except OSError as e:
