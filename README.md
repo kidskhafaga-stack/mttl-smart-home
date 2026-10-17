@@ -9,7 +9,7 @@ Local control for the Korean **LG U+ / TONLY MTTL-W01** 4-outlet smart power str
 - Several strips, each outlet controlled on its own; whole room / whole home on-off
 - Name each outlet, set the appliance type and room
 - Timers (on for / off after / on after) and schedules (repeat days or one-time, optional auto-off)
-- Charger mode: switch off automatically when a phone or laptop finishes charging
+- Charger mode: switch off automatically when a phone or laptop finishes charging, or when nothing is charging at all
 - Energy dashboard: day (hourly), week, month, year or any date range; comparison with the previous period; breakdown by appliance or room; cost in EGP; Excel export
 - LG TVs (webOS), all local: full remote (arrows/OK, back, home, settings, number pad, colour keys, media keys; keyboard shortcuts on a computer), launch any installed app with its real icon, volume slider, inputs, type text into the TV, screen off with sound on, power on via Wake-on-LAN
 - LG ThinQ appliances through LG's official ThinQ Connect API: air-conditioner thermostat with modes, fan speed and off-timer; washer/dryer progress and a log entry when a cycle finishes; fridge and freezer temperatures; every other setting the device exposes
@@ -22,7 +22,8 @@ Local control for the Korean **LG U+ / TONLY MTTL-W01** 4-outlet smart power str
 
 1. Install Python 3.8+ from python.org and tick **Add python.exe to PATH**.
 2. Double-click `Start-Strip.bat`. The first run asks for admin permission once, to open TCP port 10086 in Windows Firewall.
-3. The control page opens at `http://127.0.0.1:8080`. Keep the black window open — schedules and timers run while the app runs.
+3. The control page opens at `http://127.0.0.1:8080`. Schedules, timers and charger mode run inside the app (the strip itself stores nothing), so keep it running.
+4. Optional: **Settings → Start with Windows** runs the app hidden in the background whenever the laptop starts. Running `Start-Strip.bat` while it's already running just opens the page; the background log goes to `mttl.log`.
 
 On other systems: `python3 mttl_app.py`.
 

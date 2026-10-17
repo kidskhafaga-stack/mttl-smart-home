@@ -69,6 +69,17 @@ ONOFF_RE = re.compile(r"^up:(?:event:)?onoff:([0-4]):(on|off)$", re.I)
 SETUP_PREFIXES = ("TONLY_TAP_", "ONLY_TAP_")
 
 
+if sys.stdout is None or "--background" in sys.argv:
+    # started hidden (Windows startup): keep a small log file next to the app instead
+    try:
+        _lf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mttl.log")
+        if os.path.exists(_lf) and os.path.getsize(_lf) > 2_000_000:
+            os.replace(_lf, _lf + ".old")
+        sys.stdout = sys.stderr = open(_lf, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+
+
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
 
@@ -899,8 +910,9 @@ AO_STATE = {}   # (mac, n) -> {"armed": bool, "below": epoch or None}
 
 
 def autooff_check():
-    """Charger mode: once the outlet has drawn more than `w` watts (charging started),
-    switch it off after it stays below `w` for `min` minutes (battery full)."""
+    """Charger mode: switch the outlet off once it has stayed below `w` watts for `min`
+    minutes - either after charging finished (armed) or because nothing ever started
+    charging (device already full / nothing plugged in)."""
     now = time.time()
     for mac, s in list(STRIPS.items()):
         if not s.has_data:
@@ -914,13 +926,13 @@ def autooff_check():
                 continue
             if o["power_w"] > cfg["w"]:
                 st.update(armed=True, below=None)
-            elif st["armed"]:
-                if st["below"] is None:
-                    st["below"] = now
-                elif now - st["below"] >= cfg["min"] * 60:
-                    st.update(armed=False, below=None)
-                    clear_timer(mac, n)
-                    outlet_cmd(mac, n, False, tr("الشحن خلص", "charging finished"))
+            elif st["below"] is None:
+                st["below"] = now
+            elif now - st["below"] >= cfg["min"] * 60:
+                why = tr("الشحن خلص", "charging finished") if st["armed"] else tr("مفيش حاجة بتشحن", "nothing was charging")
+                st.update(armed=False, below=None)
+                clear_timer(mac, n)
+                outlet_cmd(mac, n, False, why)
 
 
 def poll_loop():
@@ -1822,6 +1834,7 @@ def state_json():
         "home_ssid": CFG.get("home_ssid", ""),
         "is_windows": IS_WIN,
         "auth_enabled": auth_enabled(),
+        "autostart": autostart_enabled(),
         "lang": CFG.get("lang", "ar"),
         "lg": {"tvs": tvs_json(), "thinq": thinq_json(), "pair": TV_PAIR},
         "today_wh": round(sum(twh.values()), 1),
@@ -2179,6 +2192,10 @@ class Web(BaseHTTPRequestHandler):
                 if b.get("label"):
                     event((tr("تشغيل ", "On: ") if b["on"] else tr("إطفاء ", "Off: ")) + str(b["label"])[:40], "ok")
                 return self._send(200, {"ok": True})
+
+            if p == "/api/autostart":
+                set_autostart(bool(b.get("enabled")))
+                return self._send(200, {"ok": True, "autostart": autostart_enabled()})
 
             if p == "/api/lang":
                 if b.get("lang") not in ("ar", "en"):
@@ -2906,6 +2923,12 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
             <p class="lead" data-t="langLead"></p>
             <div class="seg full" id="lang-seg"><button data-v="ar">العربية</button><button data-v="en">English</button></div>
           </div>
+          <div class="panel" style="margin-top:16px" id="as-panel">
+            <h2 data-t="asTitle"></h2>
+            <p class="lead" data-t="asLead"></p>
+            <label class="check"><input type="checkbox" id="as-on" onchange="setAutostart(this.checked)"><span data-t="asCheck"></span></label>
+            <p class="hint" id="as-note" style="margin-top:10px"></p>
+          </div>
         </div>
       </div>
     </section>
@@ -3091,7 +3114,7 @@ ar:{
  pwNew:'كلمة السر الجديدة',pwAgain:'اكتبها تاني',pwSave:'حفظ كلمة السر',pwOff:'إلغاء كلمة السر',logout:'خروج من الجهاز ده',pwShort:'كلمة السر لازم 6 حروف على الأقل',pwMismatch:'الخانتين مش زي بعض',pwSaved:'اتحفظت كلمة السر',
  pwConfirmOff:'تلغي كلمة السر؟ أي حد على الشبكة هيقدر يتحكم.',pwForgot:'لو نسيت كلمة السر: اقفل البرنامج، وافتح <code>mttl.db</code> بأي برنامج SQLite، وامسح صف <code>auth</code> من جدول <code>settings</code>.',
  aoTitle:'اطفي لوحدها لما الشحن يخلص',aoLead:'للشواحن: لما الموبايل أو اللاب يوصل 100% السحب بيقع. لو فضل أقل من الحد ده المدة دي، الفيشة تفصل. بتشتغل بس بعد ما الشحن يبدأ فعلاً.',
- aoW:'وات (الحد)',aoMin:'دقيقة',aoWatch:'هتفصل لما الشحن يخلص',aoWait:'مستني الشحن يبدأ',aoCount:'الشحن خلص — هتفصل بعد {0}',
+ aoW:'وات (الحد)',aoMin:'دقيقة',aoWatch:'هتفصل لما الشحن يخلص',aoWait:'مستني الشحن يبدأ',aoCount:'الشحن خلص — هتفصل بعد {0}',aoIdle:'مفيش شحن — هتفصل بعد {0}',
  lgTitle:'أجهزة LG',lgSet:'ربط أجهزة LG',lgSetLead:'التلفزيون بيتربط على شبكة البيت مباشرة. التكييف والغسالة والتلاجة بيتربطوا بحساب LG ThinQ بتاعك.',
  tvSec:'التلفزيون (webOS)',tvSecLead:'التلفزيون لازم يكون شغال وعلى نفس الشبكة. أول مرة هيظهر على الشاشة طلب اتصال، دوس قبول بالريموت.',
  findTv:'دوّر على التلفزيون',searching:'بدوّر…',noTvFound:'ما لقيتش تلفزيون. اتأكد إنه شغال، أو اكتب عنوانه تحت.',pair:'اربط',paired:'مربوط',tvIp:'عنوان التلفزيون (IP)',
@@ -3108,7 +3131,9 @@ ar:{
  kbHint:'على اللاب: الأسهم وEnter وBackspace والـ + و− شغالين كريموت',channelNow:'قناة {0}',textPh:'اكتب هنا وابعته للتلفزيون (مثلاً بحث في يوتيوب)',
  more:'المزيد',target:'المطلوبة',roomT:'الغرفة دلوقتي {0}°',fanSpeed:'سرعة الهوا',modeL:'الوضع',autoOffIn:'هيطفي بعد {0}',offAfterL:'اطفي بعد',hShort:'{0} س',
  progressOf:'من {0}',locs:{FRIDGE:'الثلاجة',FREEZER:'الفريزر',CONVERTIBLE:'الدرج المتحول',MAIN:'الرئيسي',KIMCHI:'الكيمتشي'},noControls:'الجهاز ده مش بيقبل أوامر من بره، بيعرض حالته بس.',
- langTitle:'اللغة',langLead:'لغة البرنامج والرسايل والسجل.',error:'حصل خطأ',
+ asTitle:'يشتغل مع الويندوز',asLead:'المواعيد والمؤقتات ووضع الشاحن بتشتغل من البرنامج، فلازم يكون شغال. فعّل دي وهو هيشتغل لوحده في الخلفية أول ما تفتح اللاب، من غير شباك أسود.',
+ asCheck:'شغّل البرنامج في الخلفية مع بداية الويندوز',asOnNote:'من المرة الجاية بعد ما تفتح اللاب، افتح الصفحة من المفضلة أو دبل كليك على Start-Strip.bat — هيفتحلك الصفحة على طول.',
+ asOnToast:'هيشتغل مع الويندوز',asOffToast:'اتلغى التشغيل مع الويندوز',langTitle:'اللغة',langLead:'لغة البرنامج والرسايل والسجل.',error:'حصل خطأ',
  types:{tv:'تلفزيون',heater:'سخان',ac:'تكييف',fridge:'تلاجة',washer:'غسالة',kettle:'غلاية',lamp:'إضاءة',fan:'مروحة',router:'راوتر',charger:'شاحن',pc:'كمبيوتر',pump:'موتور مياه',other:'تاني'},
  rooms:['الصالة','المطبخ','أوضة النوم','أوضة الأطفال','الحمام','المكتب','البلكونة'],
  days:['الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت','الأحد'],dShort:['اثنين','ثلاثاء','أربعاء','خميس','جمعة','سبت','أحد'],
@@ -3167,7 +3192,7 @@ en:{
  pwNew:'New password',pwAgain:'Type it again',pwSave:'Save password',pwOff:'Remove password',logout:'Sign out on this device',pwShort:'Password must be at least 6 characters',pwMismatch:'The two fields don\'t match',pwSaved:'Password saved',
  pwConfirmOff:'Remove the password? Anyone on your network will be able to control the strips.',pwForgot:'Forgot it? Close the app, open <code>mttl.db</code> in any SQLite tool, and delete the <code>auth</code> row from the <code>settings</code> table.',
  aoTitle:'Turn off when charging is done',aoLead:'For chargers: when a phone or laptop reaches 100% the draw drops. If it stays below this limit for this long, the outlet switches off. It only arms after charging has actually started.',
- aoW:'W (limit)',aoMin:'minutes',aoWatch:'Turns off when charging is done',aoWait:'Waiting for charging to start',aoCount:'Charging done — off in {0}',
+ aoW:'W (limit)',aoMin:'minutes',aoWatch:'Turns off when charging is done',aoWait:'Waiting for charging to start',aoCount:'Charging done — off in {0}',aoIdle:'Nothing charging — off in {0}',
  lgTitle:'LG devices',lgSet:'Connect LG devices',lgSetLead:'The TV connects directly over your home network. Air conditioners, washers and fridges connect through your LG ThinQ account.',
  tvSec:'TV (webOS)',tvSecLead:'The TV must be on and on the same network. The first time, a connection request appears on screen — accept it with the remote.',
  findTv:'Find TV',searching:'Searching…',noTvFound:'No TV found. Make sure it\'s on, or type its address below.',pair:'Pair',paired:'Paired',tvIp:'TV address (IP)',
@@ -3184,7 +3209,9 @@ en:{
  kbHint:'On a computer: arrows, Enter, Backspace and + / − work as the remote',channelNow:'Channel {0}',textPh:'Type here and send it to the TV (e.g. a YouTube search)',
  more:'More',target:'Target',roomT:'Room is {0}°',fanSpeed:'Fan speed',modeL:'Mode',autoOffIn:'Turns off in {0}',offAfterL:'Off after',hShort:'{0} h',
  progressOf:'of {0}',locs:{FRIDGE:'Fridge',FREEZER:'Freezer',CONVERTIBLE:'Convertible',MAIN:'Main',KIMCHI:'Kimchi'},noControls:'This device only reports its status; it doesn\'t accept remote commands.',
- langTitle:'Language',langLead:'Language for the app, messages and activity log.',error:'Something went wrong',
+ asTitle:'Start with Windows',asLead:'Schedules, timers and charger mode run inside this app, so it must be running. Turn this on and it starts by itself in the background when the laptop starts, with no black window.',
+ asCheck:'Run the app in the background when Windows starts',asOnNote:'After the next restart, open the page from your bookmark or double-click Start-Strip.bat — it just opens the page.',
+ asOnToast:'Will start with Windows',asOffToast:'Start with Windows turned off',langTitle:'Language',langLead:'Language for the app, messages and activity log.',error:'Something went wrong',
  types:{tv:'TV',heater:'Water heater',ac:'Air con',fridge:'Fridge',washer:'Washer',kettle:'Kettle',lamp:'Lights',fan:'Fan',router:'Router',charger:'Charger',pc:'Computer',pump:'Water pump',other:'Other'},
  rooms:['Living room','Kitchen','Bedroom','Kids room','Bathroom','Office','Balcony'],
  days:['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],dShort:['Mon','Tue','Wed','Thu','Fri','Sat','Sun'],
@@ -3301,7 +3328,7 @@ function infoHTML(d,o){
   if(o.timer)h+=`<div class="chip-i t"><span>${sv(P.timer,13)} ${t(o.timer.action==='off'?'offIn':'onIn','<span class="ltr">'+fmtLeft(o.timer.left)+'</span>')}</span><button class="link" onclick="cancelTimer('${d.mac}',${o.n})">${t('cancelIt')}</button></div>`;
   if(o.next)h+=`<div class="chip-i s"><span>${sv(P.cal,13)} ${t(o.next.action==='on'?'nextOn':'nextOff',whenText(o.next.at))}</span></div>`;
   if(o.pending)h+=`<div class="chip-i t"><span>${t('queued')}</span></div>`;
-  if(o.autooff&&o.on)h+=`<div class="chip-i c"><span>${sv(TYPE_P.charger,13)} ${o.autooff.left!=null?t('aoCount','<span class="ltr">'+fmtLeft(o.autooff.left)+'</span>'):o.autooff.armed?t('aoWatch'):t('aoWait')}</span></div>`;
+  if(o.autooff&&o.on)h+=`<div class="chip-i c"><span>${sv(TYPE_P.charger,13)} ${o.autooff.left!=null?t(o.autooff.armed?'aoCount':'aoIdle','<span class="ltr">'+fmtLeft(o.autooff.left)+'</span>'):o.autooff.armed?t('aoWatch'):t('aoWait')}</span></div>`;
   return h;
 }
 function slotHTML(d,o){
@@ -3748,7 +3775,10 @@ async function runDiag(){
   }catch(e){box.innerHTML=`<div class="err">${t('diagFail',esc(e.message))}</div>`}
   b.disabled=false;b.textContent=t('diagAgain');
 }
-function renderPw(){const on=S&&S.auth_enabled;$('pw-state').textContent=on?t('pwOn'):t('pwNone');
+function renderAs(){if(!S)return;const p=$('as-panel');if(S.autostart===null||S.autostart===undefined){p.style.display='none';return}
+  p.style.display='';$('as-on').checked=!!S.autostart;$('as-note').textContent=S.autostart?t('asOnNote'):''}
+async function setAutostart(on){try{await api('/api/autostart',{enabled:on});await refresh();renderAs();toast(on?t('asOnToast'):t('asOffToast'))}catch(e){toast(e.message,1);renderAs()}}
+function renderPw(){renderAs();const on=S&&S.auth_enabled;$('pw-state').textContent=on?t('pwOn'):t('pwNone');
   $('pw-off').style.display=on?'':'none';$('pw-logout').style.display=on?'':'none';$('pw-err').textContent='';
   if(!$('diag').innerHTML)$('diag-go').textContent=t('diagGo')}
 async function savePw(){const a=$('pw1').value,b=$('pw2').value;
@@ -3817,14 +3847,54 @@ def finish_migration():
         log("imported settings from mttl_config.json into mttl.db (old file kept as .bak)")
 
 
+# ---------------------------------------------------------------- start with Windows
+def autostart_file():
+    if os.name != "nt" or not os.environ.get("APPDATA"):
+        return None
+    return os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu", "Programs",
+                        "Startup", "MTTL Smart Home.vbs")
+
+
+def autostart_enabled():
+    f = autostart_file()
+    return None if f is None else os.path.exists(f)
+
+
+def set_autostart(on):
+    f = autostart_file()
+    if f is None:
+        raise ValueError(tr("الخاصية دي للويندوز بس", "Only available on Windows"))
+    if not on:
+        if os.path.exists(f):
+            os.remove(f)
+        return
+    exe = sys.executable
+    w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(w):
+        exe = w
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.abspath(__file__)
+    q = lambda x: x.replace('"', '""')
+    vbs = ('Set sh = CreateObject("WScript.Shell")\r\n'
+           'sh.CurrentDirectory = "%s"\r\n'
+           'sh.Run """%s"" ""%s"" --no-browser --background", 0, False\r\n') % (q(here), q(exe), q(script))
+    os.makedirs(os.path.dirname(f), exist_ok=True)
+    with open(f, "w", encoding="utf-16") as fh:
+        fh.write(vbs)
+
+
 def main():
     finish_migration()
     try:
         dev = ThreadedTCP(("0.0.0.0", DEVICE_PORT), DeviceHandler)
     except OSError as e:
-        print("\n[!] Port %d is busy - the app is probably already running in another window." % DEVICE_PORT)
-        print("    Close the other window and try again. (%s)" % e)
-        input("Press Enter to exit...")
+        if "--background" in sys.argv:
+            log("already running:", e)
+            return
+        print("\n  The app is already running (maybe in the background since Windows started).")
+        print("  Opening the control page...")
+        webbrowser.open("http://127.0.0.1:%d" % WEB_PORT)
+        time.sleep(3)
         return
     threading.Thread(target=dev.serve_forever, daemon=True).start()
     threading.Thread(target=poll_loop, daemon=True).start()
