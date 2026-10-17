@@ -1436,16 +1436,37 @@ def tv_find(tv_id):
     return None
 
 
+# With "Quick Start+" / "Turn on via Wi-Fi" the TV keeps its network link while it is off,
+# so answering on the socket doesn't mean the screen is on - the power state decides.
+TV_OFF_STATES = {"Active Standby", "Suspend", "Power Off"}
+TV_OFF_PROCESSING = {"Request Power Off", "Request Suspend", "Prepare Suspend", "Request Active Standby"}
+
+
+def tv_power_state(tv):
+    """Returns (is_on, state) from getPowerState, or (None, "") if the TV doesn't support it."""
+    try:
+        ps = tv_request(tv, "com.webos.service.tvpower/power/getPowerState")
+    except TVError:
+        if not TV_CONN.get(tv["id"]):        # connection lost -> really unreachable
+            raise
+        return None, ""
+    state, proc = ps.get("state", ""), ps.get("processing", "")
+    return not (state in TV_OFF_STATES or proc in TV_OFF_PROCESSING), state
+
+
 def tv_refresh(tv):
     st = TV_STATE.setdefault(tv["id"], {})
     try:
+        is_on, pstate = tv_power_state(tv)
+        if is_on is False:
+            st.update(on=False, standby=True, error="", power=pstate, channel=None)
+            st["at"] = time.time()
+            return
+        st["standby"] = False
         vol = tv_request(tv, "audio/getVolume")
         vs = vol.get("volumeStatus", vol)
         st.update(on=True, error="", volume=vs.get("volume"), muted=vs.get("muteStatus", vs.get("muted")))
-        try:
-            st["power"] = tv_request(tv, "com.webos.service.tvpower/power/getPowerState").get("state", "")
-        except TVError:
-            st["power"] = ""
+        st["power"] = pstate
         try:
             st["app"] = tv_request(tv, "com.webos.applicationManager/getForegroundAppInfo").get("appId", "")
         except TVError:
@@ -1474,7 +1495,7 @@ def tv_refresh(tv):
             except TVError:
                 pass
     except TVError as e:
-        st.update(on=False, error=str(e), power="", channel=None)
+        st.update(on=False, standby=False, error=str(e), power="", channel=None)
         _tv_drop(tv["id"])
     st["at"] = time.time()
 
@@ -1759,7 +1780,7 @@ def tvs_json():
         apps = st.get("apps", [])
         cur = next((a for a in apps if a["id"] == st.get("app")), None)
         out.append({"id": tv["id"], "ip": tv["ip"], "mac": tv.get("mac", ""), "name": tv.get("name") or "LG TV",
-                    "model": tv.get("model", ""), "paired": bool(tv.get("key")), "on": st.get("on"),
+                    "model": tv.get("model", ""), "paired": bool(tv.get("key")), "on": st.get("on"), "standby": bool(st.get("standby")),
                     "screen_off": st.get("power") == "Screen Off",
                     "volume": st.get("volume"), "muted": st.get("muted"), "app": st.get("app", ""),
                     "app_title": cur["title"] if cur else "", "channel": st.get("channel"),
@@ -2039,9 +2060,24 @@ class Web(BaseHTTPRequestHandler):
                 cmd, val = b.get("cmd"), b.get("value")
                 try:
                     if cmd == "power_on":
-                        wake_on_lan(tv.get("mac"))
+                        st = TV_STATE.setdefault(tv["id"], {})
+                        woke = False
+                        if st.get("standby"):
+                            # still linked while off (Quick Start+): the POWER key wakes it instantly
+                            try:
+                                if tv_power_state(tv)[0] is False:
+                                    tv_button(tv, "POWER")
+                                    woke = True
+                            except TVError:
+                                pass
+                        try:
+                            wake_on_lan(tv.get("mac"))
+                        except TVError:
+                            if not woke:
+                                raise
                     elif cmd == "power_off":
                         tv_request(tv, "system/turnOff")
+                        TV_STATE.setdefault(tv["id"], {}).update(on=False, standby=True, channel=None)
                     elif cmd == "vol_up":
                         tv_request(tv, "audio/volumeUp")
                     elif cmd == "vol_down":
@@ -2085,6 +2121,8 @@ class Web(BaseHTTPRequestHandler):
                     return self._send(502, {"error": str(e)})
                 if cmd not in ("button", "text"):
                     threading.Timer(2.5 if cmd == "power_on" else 0.8, tv_refresh, args=(tv,)).start()
+                    if cmd in ("power_on", "power_off"):       # TVs take a few seconds to settle
+                        threading.Timer(6, tv_refresh, args=(tv,)).start()
                 return self._send(200, {"ok": True})
 
             if p == "/api/tv/update":
@@ -2624,6 +2662,15 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .dev.on .pilot::after{inset-inline-start:28px;background:var(--on);box-shadow:0 0 12px #3ddc97aa}
 .dev.off .pilot{border-color:#f06a6a66}
 .dev.off .pilot::after{background:var(--off);box-shadow:0 0 10px #f06a6a66}
+.pwr{width:46px;height:46px;flex:none;border-radius:50%;display:grid;place-items:center;border:1.5px solid #f06a6a77;background:radial-gradient(circle at 50% 35%,#3a1d22,#1f1316);color:var(--off);box-shadow:0 0 0 4px #f06a6a12,0 0 14px #f06a6a33;transition:all .25s;cursor:pointer;padding:0}
+.pwr svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:2.4;stroke-linecap:round}
+.pwr:hover{transform:translateY(-1px);box-shadow:0 0 0 5px #f06a6a1c,0 0 20px #f06a6a55}
+.pwr.on{border-color:#3ddc9799;background:radial-gradient(circle at 50% 35%,#174a37,#0f2a20);color:var(--on);box-shadow:0 0 0 4px #3ddc9714,0 0 18px #3ddc9766}
+.pwr.on:hover{box-shadow:0 0 0 5px #3ddc9722,0 0 24px #3ddc9788}
+.pwr.busy{color:var(--copper);border-color:#e0a45899;background:radial-gradient(circle at 50% 35%,#40311c,#21190f);box-shadow:0 0 0 4px #e0a45814,0 0 16px #e0a45855;animation:pwrp 1s ease-in-out infinite}
+@keyframes pwrp{50%{box-shadow:0 0 0 8px #e0a45808,0 0 26px #e0a45877}}
+.pwr:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.pwr.sm{width:40px;height:40px}.pwr.sm svg{width:19px;height:19px}
 .pilot.is-on{background:var(--on-d);border-color:#3ddc9766}.pilot.is-on::after{inset-inline-start:28px;background:var(--on);box-shadow:0 0 12px #3ddc97aa}
 .pilot.is-off{border-color:#f06a6a66}.pilot.is-off::after{background:var(--off);box-shadow:0 0 10px #f06a6a66}
 .kp,.mrow,.colors{direction:ltr}
@@ -3119,7 +3166,7 @@ ar:{
  tvSec:'التلفزيون (webOS)',tvSecLead:'التلفزيون لازم يكون شغال وعلى نفس الشبكة. أول مرة هيظهر على الشاشة طلب اتصال، دوس قبول بالريموت.',
  findTv:'دوّر على التلفزيون',searching:'بدوّر…',noTvFound:'ما لقيتش تلفزيون. اتأكد إنه شغال، أو اكتب عنوانه تحت.',pair:'اربط',paired:'مربوط',tvIp:'عنوان التلفزيون (IP)',
  pairing:'بص على شاشة التلفزيون ودوس "قبول" بالريموت… (عندك دقيقة)',pairOk:'التلفزيون اتربط.',tvMac:'عنوان MAC (للتشغيل من الإطفاء)',macHint:'علشان التلفزيون يشتغل من الإطفاء: فعّل في إعداداته "التشغيل عن طريق Wi-Fi / LAN" (Turn on via Wi-Fi). البرنامج بيجيب الـ MAC لوحده لو قدر.',
- removeTv:'شيل التلفزيون',confirmRemoveTv:'تشيل التلفزيون ده؟',tvOn:'شغال',tvOff:'مقفول',tvUnknown:'مش معروف',noMac:'محتاج MAC علشان يشتغل من الإطفاء',
+ removeTv:'شيل التلفزيون',confirmRemoveTv:'تشيل التلفزيون ده؟',tvOn:'شغال',tvOff:'مقفول',pwrTurnOn:'شغّل',pwrTurnOff:'اقفل',pwrBusy:'لحظة…',tvUnknown:'مش معروف',noMac:'محتاج MAC علشان يشتغل من الإطفاء',
  volume:'الصوت',mute:'كتم',unmute:'شغّل الصوت',channel:'القناة',input:'المصدر',chooseInput:'اختار المصدر',nowApp:'شغال دلوقتي: {0}',
  thinqSec:'التكييف والغسالة والتلاجة (LG ThinQ)',thinqLead:'بيشتغل بحساب LG ThinQ بتاعك عن طريق API رسمي من LG. الأجهزة لازم تكون متضافة على تطبيق ThinQ الأول.',
  thinqSteps:'1. افتح <a href="https://connect-pat.lgthinq.com" target="_blank" rel="noopener">connect-pat.lgthinq.com</a> وادخل بحساب ThinQ.<br>2. دوس <b>ADD NEW TOKEN</b>، اكتب أي اسم، وعلّم على كل الصلاحيات.<br>3. دوس <b>CREATE TOKEN</b> وانسخ التوكن وحطه هنا.',
@@ -3197,7 +3244,7 @@ en:{
  tvSec:'TV (webOS)',tvSecLead:'The TV must be on and on the same network. The first time, a connection request appears on screen — accept it with the remote.',
  findTv:'Find TV',searching:'Searching…',noTvFound:'No TV found. Make sure it\'s on, or type its address below.',pair:'Pair',paired:'Paired',tvIp:'TV address (IP)',
  pairing:'Look at the TV and press "Accept" on the remote… (you have a minute)',pairOk:'TV paired.',tvMac:'MAC address (to turn on from off)',macHint:'To turn the TV on from off, enable "Turn on via Wi-Fi / LAN" in its settings. The app fills the MAC in automatically when it can.',
- removeTv:'Remove TV',confirmRemoveTv:'Remove this TV?',tvOn:'On',tvOff:'Off',tvUnknown:'Unknown',noMac:'Needs a MAC address to turn on',
+ removeTv:'Remove TV',confirmRemoveTv:'Remove this TV?',tvOn:'On',tvOff:'Off',pwrTurnOn:'Turn on',pwrTurnOff:'Turn off',pwrBusy:'One moment…',tvUnknown:'Unknown',noMac:'Needs a MAC address to turn on',
  volume:'Volume',mute:'Mute',unmute:'Unmute',channel:'Channel',input:'Input',chooseInput:'Choose input',nowApp:'Now playing: {0}',
  thinqSec:'Air con, washer and fridge (LG ThinQ)',thinqLead:'Works with your LG ThinQ account through LG\'s official API. Devices must already be added in the ThinQ app.',
  thinqSteps:'1. Open <a href="https://connect-pat.lgthinq.com" target="_blank" rel="noopener">connect-pat.lgthinq.com</a> and sign in with ThinQ.<br>2. Press <b>ADD NEW TOKEN</b>, give it any name, and tick all permissions.<br>3. Press <b>CREATE TOKEN</b>, copy the token and paste it here.',
@@ -3561,19 +3608,24 @@ const IC2={
 const appImg=(tv,a)=>a&&a.icon?`<img src="/api/tv/icon?id=${encodeURIComponent(tv.id)}&app=${encodeURIComponent(a.id)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'ph',textContent:'${esc((a.title||'?')[0])}'}))">`:`<span class="ph">${esc(((a&&a.title)||'?')[0])}</span>`;
 function tvNowLine(tv){if(tv.screen_off)return t('screenOffNow');if(tv.channel&&tv.channel.number)return t('channelNow',tv.channel.number+(tv.channel.name?' — '+tv.channel.name:''));return tv.app_title||tv.app||''}
 
+/* power button: green = on, red = off, amber pulse while switching */
+const PWR_PEND={};
+function pwrBtn(key,on,js,opts={}){const p=PWR_PEND[key];if(p&&(p.on===on||Date.now()>p.until))delete PWR_PEND[key];
+  const busy=!!PWR_PEND[key];
+  return `<button class="pwr${on?' on':''}${busy?' busy':''}${opts.sm?' sm':''}" aria-pressed="${!!on}" aria-label="${esc(opts.label||'')} ${busy?t('pwrBusy'):on?t('pwrTurnOff'):t('pwrTurnOn')}" title="${busy?t('pwrBusy'):on?t('pwrTurnOff'):t('pwrTurnOn')}" ${opts.disabled?'disabled':''} onclick="PWR_PEND['${key}']={on:${!on},until:Date.now()+20000};this.classList.add('busy');${js}"><svg viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M6.6 6.6a8 8 0 1 0 10.8 0"/></svg></button>`}
 function tvCard(tv){
   const st=tv.on===true?'on':tv.on===false?'off':'',cur=tv.apps.find(a=>a.id===tv.app);
   const quick=tv.apps.slice(0,8);
   return `<div class="dev ${st}"><div class="dev-h"><div class="ico">${tIco('tv',22)}</div>
-    <div class="tx"><b>${esc(tv.name)}</b><small>${tv.on?t('tvOn'):tv.on===false?t('tvOff'):t('tvUnknown')}${tv.model?t('sep')+esc(tv.model):''}</small></div>
-    <button class="pilot" aria-pressed="${!!tv.on}" aria-label="${esc(tv.name)}" ${!tv.on&&!tv.mac?'disabled title="'+t('noMac')+'"':''} onclick="tvCmd('${tv.id}','${tv.on?'power_off':'power_on'}')"></button></div>
+    <div class="tx"><b>${esc(tv.name)}</b><small>${PWR_PEND['tv:'+tv.id]?t('pwrBusy'):tv.on?t('tvOn'):tv.on===false?t('tvOff'):t('tvUnknown')}${tv.model?t('sep')+esc(tv.model):''}</small></div>
+    ${pwrBtn('tv:'+tv.id,!!tv.on,`tvCmd('${tv.id}','${tv.on?'power_off':'power_on'}')`,{label:tv.name,disabled:!tv.on&&!tv.mac&&!tv.standby})}</div>
     ${tv.on?`
       ${tvNowLine(tv)?`<div class="now">${tv.channel&&tv.channel.number?`<span class="ph">${sv(TYPE_P.tv,18)}</span>`:appImg(tv,cur)}<div style="min-width:0"><b>${esc(tvNowLine(tv))}</b></div></div>`:''}
       <div class="vol"><button class="iconbtn ${tv.muted?'on':''}" title="${t(tv.muted?'unmute':'mute')}" onclick="tvCmd('${tv.id}','mute',${!tv.muted})">${sv(tv.muted?IC2.mute:IC2.vol,17)}</button>
         <input type="range" min="0" max="100" value="${tv.volume??0}" aria-label="${t('volume')}" onpointerdown="editing=true" oninput="this.nextElementSibling.textContent=this.value" onchange="editing=false;tvCmd('${tv.id}','volume',+this.value)"><b class="ltr">${tv.volume??'—'}</b></div>
       ${quick.length?`<div class="approw">${quick.map(a=>`<button class="appb ${a.id===tv.app?'cur':''}" title="${esc(a.title)}" onclick="tvCmd('${tv.id}','launch','${esc(a.id)}')">${appImg(tv,a)}<span>${esc(a.title)}</span></button>`).join('')}</div>`:''}
       <div class="dev-acts"><button class="btn primary sm" onclick="openRemote('${tv.id}')">${sv(IC2.remote,16)}${t('remote')}</button><button class="btn sm" onclick="tvCmd('${tv.id}','${tv.screen_off?'screen_on':'screen_off'}')">${sv(IC2.screen,16)}${t(tv.screen_off?'screenOn':'screenOff')}</button></div>`
-    :(!tv.mac?`<div class="hint" style="margin:0">${t('noMac')}</div>`:'')}
+    :(!tv.mac&&!tv.standby?`<div class="hint" style="margin:0">${t('noMac')}</div>`:'')}
   </div>`;
 }
 
@@ -3584,7 +3636,7 @@ function rmBtn(name){const tv=S.lg.tvs.find(x=>x.id===RM);if(!tv)return;api('/ap
 function drawRemote(full){
   const tv=S&&S.lg.tvs.find(x=>x.id===RM),box=$('remote-body');if(!tv||!box)return;
   const head=`<div class="rm-top"><div class="tx"><b>${esc(tv.name)}</b><small id="rm-now">${esc(tv.on?tvNowLine(tv)||t('tvOn'):t('tvOff'))}</small></div>
-    <div style="display:flex;gap:6px"><button class="pilot ${tv.on?'is-on':'is-off'}" aria-pressed="${!!tv.on}" ${!tv.on&&!tv.mac?'disabled':''} onclick="tvCmd('${tv.id}','${tv.on?'power_off':'power_on'}')"></button>
+    <div style="display:flex;gap:6px">${pwrBtn('tv:'+tv.id,!!tv.on,`tvCmd('${tv.id}','${tv.on?'power_off':'power_on'}')`,{label:tv.name,sm:1,disabled:!tv.on&&!tv.mac&&!tv.standby})}
     <button class="iconbtn" aria-label="${t('cancel')}" onclick="closeM('m-remote')">${sv('<path d="M6 6l12 12M18 6L6 18"/>',16)}</button></div></div>`;
   if(!full){const n=$('rm-now');if(n)n.textContent=tv.on?tvNowLine(tv)||t('tvOn'):t('tvOff');const v=$('rm-vol');if(v&&document.activeElement!==v){v.value=tv.volume??0;$('rm-volv').textContent=tv.volume??'—'}return}
   const K=(name,ic,label)=>`<button onclick="rmBtn('${name}')">${sv(ic,18)}<span>${label}</span></button>`;
@@ -3640,7 +3692,7 @@ function timerHTML(d){
 function powerOf(d){const c=d.controls.find(c_=>c_.type==='enum'&&c_.values.includes('POWER_ON')&&c_.values.includes('POWER_OFF'));return c?{c,on:stLoc(d,c.res,c.key)==='POWER_ON'}:null}
 function devHead(d,pw){return `<div class="dev-h"><div class="ico">${tIco(lgIcon(d.type),22)}</div>
     <div class="tx"><b>${esc(d.alias)}</b><small>${esc(lgType(d.type))}${d.model?t('sep')+esc(d.model):''}</small></div>
-    ${pw?`<button class="pilot ${pw.on?'is-on':'is-off'}" aria-pressed="${pw.on}" ${d.online?'':'disabled'} onclick="${ctlJS(d,pw.c,pw.on?'POWER_OFF':'POWER_ON')}"></button>`:''}</div>
+    ${pw?pwrBtn('lg:'+d.id,!!pw.on,ctlJS(d,pw.c,pw.on?'POWER_OFF':'POWER_ON'),{label:d.alias||'',disabled:!d.online}):''}</div>
     ${!d.online?`<div class="dev-err">${t('devOffline')}</div>`:d.error?`<div class="dev-err">${esc(d.error)}</div>`:''}`}
 function thinqCard(d){
   const pw=powerOf(d),cls=pw?(pw.on?'on':'off'):'';
