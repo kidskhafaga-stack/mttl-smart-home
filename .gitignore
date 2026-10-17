@@ -1,0 +1,6 @@
+mttl.db
+mttl.db-*
+*.bak
+mttl_config.json
+__pycache__/
+*.pyc

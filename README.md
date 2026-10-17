@@ -1,0 +1,59 @@
+# البيت الذكي — Smart Home for MTTL-W01 strips
+
+Local control for the Korean **LG U+ / TONLY MTTL-W01** 4-outlet smart power strip (the "مشترك الكوري"), without the Korean cloud, an internet connection, or a subscription.
+
+تحكم محلي في المشترك الكوري MTTL-W01 من غير سيرفرات كورية ولا إنترنت ولا اشتراك.
+
+## Features · المميزات
+
+- Several strips, each outlet controlled on its own; whole room / whole home on-off
+- Name each outlet, set the appliance type and room
+- Timers (on for / off after / on after) and schedules (repeat days or one-time, optional auto-off)
+- Charger mode: switch off automatically when a phone or laptop finishes charging
+- Daily energy per appliance, with cost in EGP
+- Guided Wi-Fi setup for new strips, network diagnostics, optional password
+- Arabic and English interface
+- SQLite storage (`mttl.db`)
+
+## Run · التشغيل (Windows)
+
+1. Install Python 3.8+ from python.org and tick **Add python.exe to PATH**.
+2. Double-click `Start-Strip.bat`. The first run asks for admin permission once, to open TCP port 10086 in Windows Firewall.
+3. The control page opens at `http://127.0.0.1:8080`. Keep the black window open — schedules and timers run while the app runs.
+
+On other systems: `python3 mttl_app.py`.
+
+## Add a strip · إضافة مشترك
+
+Once per strip. With this computer on your home Wi-Fi (2.4 GHz):
+
+1. Hold the strip's main power button for 10 seconds until the light blinks fast.
+2. Open **Add strip**, enter your Wi-Fi password and press **Start setup**.
+
+The strip stores your Wi-Fi and this computer's IP address and connects by itself from then on. Reserve this computer's IP in your router (DHCP reservation) so it never changes.
+
+## How it works · طريقة العمل
+
+| Step | Direction | Message |
+|---|---|---|
+| Setup | app → strip `192.168.1.1:30300` | `up:ip:<pc ip>` → `up:connect:<ssid>:<pass>` → `up:reboot:0` |
+| Runtime | strip → app TCP `10086` | `up:bootinfo:…`, `up:getinfo:…` telemetry |
+| Control | app → strip | `up:onoff:<1-4>:<on\|off>`, `up:getinfo:all` |
+
+Protocol details come from community reverse-engineering work:
+[AmrEmad0/MTTL-W01_APP](https://github.com/AmrEmad0/MTTL-W01_APP) and
+[HanyArnous/power_strip](https://github.com/HanyArnous/power_strip).
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `mttl_app.py` | The whole app: device server, scheduler, web UI (Python standard library only) |
+| `Start-Strip.bat` | Windows launcher: finds Python, opens the firewall port, starts the app |
+| `mttl.db` | Created on first run — strips, outlets, schedules, energy history (not committed) |
+
+## Notes
+
+- The strip only supports 2.4 GHz Wi-Fi, and the Wi-Fi name/password can't contain `:`.
+- Forgot the password? Close the app and delete the `auth` row from the `settings` table in `mttl.db`.
+- The strip protocol is plain TCP with no authentication. Keep port 10086 on your local network only.
