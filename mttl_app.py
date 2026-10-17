@@ -1163,7 +1163,7 @@ def run_diagnostics():
 # ================================================================ LG devices
 # ---------------------------------------------------------------- minimal WebSocket client (RFC 6455)
 class WSClient:
-    def __init__(self, host, port, tls, timeout=6.0):
+    def __init__(self, host, port, tls, timeout=6.0, path="/"):
         raw = socket.create_connection((host, port), timeout=timeout)
         if tls:
             ctx = ssl.create_default_context()
@@ -1172,8 +1172,8 @@ class WSClient:
             raw = ctx.wrap_socket(raw, server_hostname=host)
         raw.settimeout(timeout)
         key = base64.b64encode(os.urandom(16)).decode()
-        raw.sendall(("GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                     "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % (host, port, key)).encode())
+        raw.sendall(("GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % (path or "/", host, port, key)).encode())
         resp = b""
         while b"\r\n\r\n" not in resp:
             chunk = raw.recv(4096)
@@ -1188,7 +1188,10 @@ class WSClient:
         self.sock = raw
 
     def send(self, obj):
-        data = json.dumps(obj).encode("utf-8")
+        self.send_raw(json.dumps(obj))
+
+    def send_raw(self, text):
+        data = text.encode("utf-8")
         n = len(data)
         hdr = bytearray([0x81])
         if n < 126:
@@ -1305,12 +1308,31 @@ def _tv_open(tv, pair_wait=0):
         raise
 
 
-def tv_request(tv, uri, payload=None, timeout=6):
-    lock = TV_LOCKS.setdefault(tv["id"], threading.Lock())
-    with lock:
-        ws = _tv_open(tv)
+TV_CONN = {}      # tv id -> open, registered WSClient (reused so remote presses are instant)
+TV_PTR = {}       # tv id -> pointer-input WSClient (remote buttons)
+TV_BUTTONS = {"LEFT", "RIGHT", "UP", "DOWN", "ENTER", "BACK", "EXIT", "HOME", "MENU", "QMENU", "INFO", "GUIDE",
+              "LIST", "RED", "GREEN", "YELLOW", "BLUE", "PLAY", "PAUSE", "STOP", "REWIND", "FASTFORWARD", "RECORD",
+              "CHANNELUP", "CHANNELDOWN", "VOLUMEUP", "VOLUMEDOWN", "MUTE", "ASTERISK", "DASH", "CC", "SAP",
+              "ASPECT_RATIO", "MYAPPS", "RECENT", "INPUT_HUB", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
+_CONN_ERRORS = (OSError, ConnectionError, ssl.SSLError, ValueError)
+
+
+def _tv_drop(tv_id):
+    for pool in (TV_CONN, TV_PTR):
+        ws = pool.pop(tv_id, None)
+        if ws:
+            ws.close()
+
+
+def _tv_req_locked(tv, uri, payload=None, timeout=6):
+    """One request on the shared connection (caller holds the TV lock). Reconnects once if the socket died."""
+    for attempt in (0, 1):
+        ws = TV_CONN.get(tv["id"])
+        if ws is None:
+            ws = _tv_open(tv)                       # raises TVError if the TV is off/unreachable
+            TV_CONN[tv["id"]] = ws
         try:
-            mid = "r%d" % int(time.time() * 1000)
+            mid = "r%d_%s" % (int(time.time() * 1000), secrets.token_hex(2))
             ws.send({"id": mid, "type": "request", "uri": "ssap://" + uri, "payload": payload or {}})
             deadline = time.time() + timeout
             while time.time() < deadline:
@@ -1319,9 +1341,43 @@ def tv_request(tv, uri, payload=None, timeout=6):
                     if r.get("type") == "error":
                         raise TVError(r.get("error") or "error")
                     return r.get("payload", {})
-            raise TVError("timeout")
-        finally:
-            ws.close()
+            raise socket.timeout("no answer")
+        except _CONN_ERRORS:
+            _tv_drop(tv["id"])
+            if attempt:
+                raise TVError(tr("التلفزيون مش بيرد", "The TV isn't answering"))
+
+
+def tv_request(tv, uri, payload=None, timeout=6):
+    with TV_LOCKS.setdefault(tv["id"], threading.Lock()):
+        return _tv_req_locked(tv, uri, payload, timeout)
+
+
+def tv_button(tv, name):
+    with TV_LOCKS.setdefault(tv["id"], threading.Lock()):
+        for attempt in (0, 1):
+            try:
+                ptr = TV_PTR.get(tv["id"])
+                if ptr is None:
+                    path = _tv_req_locked(tv, "com.webos.service.networkinput/getPointerInputSocket").get("socketPath", "")
+                    u = urlparse(path)
+                    if u.scheme not in ("ws", "wss") or not u.hostname:
+                        raise TVError(tr("التلفزيون ما ادّاش مدخل للريموت", "The TV didn't provide a remote-control socket"))
+                    ptr = WSClient(u.hostname, u.port or (3001 if u.scheme == "wss" else 3000), u.scheme == "wss",
+                                   timeout=4, path=(u.path or "/") + ("?" + u.query if u.query else ""))
+                    TV_PTR[tv["id"]] = ptr
+                ptr.send_raw("type:button\nname:%s\n\n" % name)
+                return
+            except _CONN_ERRORS:
+                p_ = TV_PTR.pop(tv["id"], None)
+                if p_:
+                    p_.close()
+                if attempt:
+                    raise TVError(tr("الريموت مش متصل بالتلفزيون", "The remote couldn't reach the TV"))
+
+
+TV_ICONS = {}     # (tv id, app id) -> (content-type, bytes)
+FAV_APPS = ("youtube", "netflix", "shahid", "watchit", "osn", "amazon", "disney", "spotify", "anghami", "browser", "livetv")
 
 
 def wake_on_lan(mac):
@@ -1358,18 +1414,67 @@ def tv_refresh(tv):
         vs = vol.get("volumeStatus", vol)
         st.update(on=True, error="", volume=vs.get("volume"), muted=vs.get("muteStatus", vs.get("muted")))
         try:
+            st["power"] = tv_request(tv, "com.webos.service.tvpower/power/getPowerState").get("state", "")
+        except TVError:
+            st["power"] = ""
+        try:
             st["app"] = tv_request(tv, "com.webos.applicationManager/getForegroundAppInfo").get("appId", "")
         except TVError:
             pass
+        st["channel"] = None
+        if "livetv" in st.get("app", ""):
+            try:
+                ch = tv_request(tv, "tv/getCurrentChannel")
+                st["channel"] = {"number": ch.get("channelNumber", ""), "name": ch.get("channelName", "")}
+            except TVError:
+                pass
         if not st.get("inputs"):
             try:
                 st["inputs"] = [{"id": d.get("id"), "label": d.get("label") or d.get("id")}
                                 for d in tv_request(tv, "tv/getExternalInputList").get("devices", [])]
             except TVError:
                 pass
+        if not st.get("apps") or time.time() - st.get("apps_at", 0) > 600:
+            try:
+                pts = tv_request(tv, "com.webos.applicationManager/listLaunchPoints").get("launchPoints", [])
+                apps = [{"id": a.get("id"), "title": a.get("title") or a.get("id"),
+                         "icon": a.get("largeIcon") or a.get("icon") or ""} for a in pts if a.get("id")]
+                rank = lambda a: next((i for i, k in enumerate(FAV_APPS) if k in a["id"].lower()), 99)
+                st["apps"] = sorted(apps, key=lambda a: (rank(a), a["title"].lower()))
+                st["apps_at"] = time.time()
+            except TVError:
+                pass
     except TVError as e:
-        st.update(on=False, error=str(e))
+        st.update(on=False, error=str(e), power="", channel=None)
+        _tv_drop(tv["id"])
     st["at"] = time.time()
+
+
+def tv_icon(tv, app_id):
+    key = (tv["id"], app_id)
+    if key in TV_ICONS:
+        return TV_ICONS[key]
+    app = next((a for a in TV_STATE.get(tv["id"], {}).get("apps", []) if a["id"] == app_id), None)
+    if not app or not app["icon"]:
+        return None
+    url = app["icon"]
+    if url.startswith("/"):
+        url = "http://%s:3000%s" % (tv["ip"], url)
+    u = urlparse(url)
+    if u.hostname not in (tv["ip"], "localhost", "127.0.0.1"):       # only ever fetch from the TV itself
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(url, timeout=4, context=ctx) as r:
+            data = r.read(512 * 1024)
+            ctype = r.headers.get("Content-Type", "image/png")
+    except Exception:
+        return None
+    if len(TV_ICONS) > 300:
+        TV_ICONS.clear()
+    TV_ICONS[key] = (ctype, data)
+    return TV_ICONS[key]
 
 
 def tv_loop():
@@ -1512,7 +1617,11 @@ def thinq_refresh(full=False):
             THINQ_STATUS["list_at"] = time.time()
         for did, cur in list(THINQ_DEV.items()):
             try:
+                old = _run_state(cur.get("state"))
                 cur["state"] = thinq_call("GET", "devices/%s/state" % did) or {}
+                new = _run_state(cur["state"])
+                if old and new != old and new in ("END", "COMPLETE", "FINISHED"):
+                    event(tr("%s خلصت", "%s finished") % cur.get("alias", ""), "ok")
                 cur["error"], cur["online"] = "", True
             except ThinQError as e:
                 cur["error"], cur["online"] = str(e), e.code not in ("1222",)
@@ -1521,6 +1630,13 @@ def thinq_refresh(full=False):
         THINQ_STATUS.update(error="", at=time.time())
     except ThinQError as e:
         THINQ_STATUS.update(error=str(e), at=time.time())
+
+
+def _run_state(state):
+    rs = (state or {}).get("runState") if isinstance(state, dict) else None
+    if isinstance(rs, list):
+        rs = rs[0] if rs else None
+    return (rs or {}).get("currentState") if isinstance(rs, dict) else None
 
 
 def thinq_loop():
@@ -1537,31 +1653,37 @@ def _writable(prop):
 
 
 def thinq_controls(profile):
-    """Turn a ThinQ profile into a generic list of controls the UI can render."""
+    """Turn a ThinQ profile into a generic list of controls the UI can render.
+    List resources are either per-unit (pick Celsius) or per-location (fridge/freezer...)."""
     out = []
     if not isinstance(profile, dict):
         return out
     for res, props in profile.items():
-        unit = None
-        if isinstance(props, list):                       # e.g. temperatureInUnits: one entry per unit
-            props = next((p for p in props if isinstance(p, dict) and p.get("unit") == "C"), None)
-            unit = "C"
-        if not isinstance(props, dict):
-            continue
-        for key, prop in props.items():
-            if not _writable(prop):
-                continue
-            typ, val = prop.get("type"), (prop.get("value") or {}).get("w")
-            c = {"res": res, "key": key, "type": typ, "unit": unit}
-            if typ == "enum" and isinstance(val, list) and val:
-                c["values"] = val
-            elif typ == "range" and isinstance(val, dict):
-                c.update(min=val.get("min"), max=val.get("max"), step=val.get("step") or 1)
-            elif typ == "boolean":
-                pass
+        groups = []
+        if isinstance(props, list):
+            entries = [x for x in props if isinstance(x, dict)]
+            if any("locationName" in x for x in entries):
+                groups = [(x, None, x.get("locationName")) for x in entries]
             else:
-                continue
-            out.append(c)
+                c = next((x for x in entries if x.get("unit") == "C"), None)
+                groups = [(c, "C", None)] if c else []
+        elif isinstance(props, dict):
+            groups = [(props, None, None)]
+        for gp, unit, loc in groups:
+            for key, prop in gp.items():
+                if not _writable(prop) or key.endswith("TemperatureF"):
+                    continue
+                typ, val = prop.get("type"), (prop.get("value") or {}).get("w")
+                c = {"res": res, "key": key, "type": typ, "unit": unit, "loc": loc}
+                if typ == "enum" and isinstance(val, list) and val:
+                    c["values"] = val
+                elif typ == "range" and isinstance(val, dict):
+                    c.update(min=val.get("min"), max=val.get("max"), step=val.get("step") or 1)
+                elif typ == "boolean":
+                    pass
+                else:
+                    continue
+                out.append(c)
     return out
 
 
@@ -1573,8 +1695,12 @@ def thinq_flat_state(state):
     for res, val in state.items():
         if isinstance(val, list):
             items = [v for v in val if isinstance(v, dict)]
-            c = next((v for v in items if v.get("unit") == "C"), None)
-            for v in ([c] if c else items):
+            if any("locationName" in v for v in items):
+                pick = items                                   # fridge/freezer...: every location
+            else:
+                c = next((v for v in items if v.get("unit") == "C"), None)
+                pick = [c] if c else items
+            for v in pick:
                 loc = v.get("locationName")
                 for k, x in v.items():
                     if k not in ("unit", "locationName") and not isinstance(x, (dict, list)):
@@ -1601,9 +1727,14 @@ def tvs_json():
     out = []
     for tv in TVS:
         st = TV_STATE.get(tv["id"], {})
+        apps = st.get("apps", [])
+        cur = next((a for a in apps if a["id"] == st.get("app")), None)
         out.append({"id": tv["id"], "ip": tv["ip"], "mac": tv.get("mac", ""), "name": tv.get("name") or "LG TV",
                     "model": tv.get("model", ""), "paired": bool(tv.get("key")), "on": st.get("on"),
+                    "screen_off": st.get("power") == "Screen Off",
                     "volume": st.get("volume"), "muted": st.get("muted"), "app": st.get("app", ""),
+                    "app_title": cur["title"] if cur else "", "channel": st.get("channel"),
+                    "apps": [{"id": a["id"], "title": a["title"], "icon": bool(a["icon"])} for a in apps],
                     "inputs": st.get("inputs", []), "error": st.get("error", "")})
     return out
 
@@ -1690,7 +1821,8 @@ class Web(BaseHTTPRequestHandler):
             body = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
+        if "Cache-Control" not in (headers or {}):
+            self.send_header("Cache-Control", "no-store")
         for hk, hv in (headers or {}).items():
             self.send_header(hk, hv)
         if cookie is not None:
@@ -1726,6 +1858,13 @@ class Web(BaseHTTPRequestHandler):
             return self._send(401, {"error": "login"})
         if p == "/":
             return self._send(200, page_html().encode("utf-8"), "text/html; charset=utf-8")
+        if p == "/api/tv/icon":
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            tv = tv_find(q.get("id"))
+            ic = tv_icon(tv, q.get("app", "")) if tv else None
+            if not ic:
+                return self._send(404, {"error": "icon"})
+            return self._send(200, ic[1], ic[0], headers={"Cache-Control": "max-age=86400"})
         if p == "/api/lg/discover":
             return self._send(200, {"tvs": ssdp_discover_tvs()})
         if p == "/api/diag":
@@ -1878,11 +2017,33 @@ class Web(BaseHTTPRequestHandler):
                         tv_request(tv, "tv/switchInput", {"inputId": str(val)})
                     elif cmd == "toast":
                         tv_request(tv, "system.notifications/createToast", {"message": str(val)[:120]})
+                    elif cmd == "button":
+                        if str(val) not in TV_BUTTONS:
+                            return self._send(400, {"error": "button"})
+                        tv_button(tv, str(val))
+                    elif cmd == "launch":
+                        tv_request(tv, "system.launcher/launch", {"id": str(val)})
+                    elif cmd == "text":
+                        tv_request(tv, "com.webos.service.ime/insertText", {"text": str(val)[:200], "replace": 0})
+                    elif cmd == "enter":
+                        tv_request(tv, "com.webos.service.ime/sendEnterKey")
+                    elif cmd == "screen_off":
+                        tv_request(tv, "com.webos.service.tvpower/power/turnOffScreen", {"standbyMode": "active"})
+                    elif cmd == "screen_on":
+                        tv_request(tv, "com.webos.service.tvpower/power/turnOnScreen", {"standbyMode": "active"})
+                    elif cmd in ("play", "pause", "stop", "rewind", "fastForward"):
+                        tv_request(tv, "media.controls/" + cmd)
+                    elif cmd == "channel":
+                        num = re.sub("[^0-9-]", "", str(val))[:6]
+                        for ch in num:
+                            tv_button(tv, "DASH" if ch == "-" else ch)
+                        tv_button(tv, "ENTER")
                     else:
                         return self._send(400, {"error": "cmd"})
                 except TVError as e:
                     return self._send(502, {"error": str(e)})
-                threading.Timer(2.5 if cmd == "power_on" else 0.6, tv_refresh, args=(tv,)).start()
+                if cmd not in ("button", "text"):
+                    threading.Timer(2.5 if cmd == "power_on" else 0.8, tv_refresh, args=(tv,)).start()
                 return self._send(200, {"ok": True})
 
             if p == "/api/tv/update":
@@ -1903,6 +2064,7 @@ class Web(BaseHTTPRequestHandler):
             if p == "/api/tv/remove":
                 with LOCK:
                     TVS[:] = [x for x in TVS if x["id"] != b.get("id")]
+                    _tv_drop(b.get("id"))
                     TV_STATE.pop(b.get("id"), None)
                     save_cfg()
                 return self._send(200, {"ok": True})
@@ -1944,20 +2106,30 @@ class Web(BaseHTTPRequestHandler):
                 dev = THINQ_DEV.get(did)
                 if not dev:
                     return self._send(404, {"error": tr("جهاز مش معروف", "Unknown device")})
-                ok = [c for c in thinq_controls(dev.get("profile")) if c["res"] == b.get("res") and c["key"] == b.get("key")]
-                if not ok:
-                    return self._send(400, {"error": tr("الجهاز ده مش بيقبل الأمر ده", "This device doesn't accept that command")})
-                c, val = ok[0], b.get("value")
-                if c["type"] == "range":
-                    val = float(val)
-                    val = int(val) if val == int(val) else val
-                elif c["type"] == "boolean":
-                    val = bool(val)
-                elif val not in c.get("values", []):
-                    return self._send(400, {"error": tr("قيمة مش مسموحة", "Value not allowed")})
-                body = {c["res"]: {c["key"]: val}}
-                if c.get("unit"):
-                    body[c["res"]]["unit"] = c["unit"]
+                values = b.get("values") or {b.get("key"): b.get("value")}
+                ctrls = {c["key"]: c for c in thinq_controls(dev.get("profile"))
+                         if c["res"] == b.get("res") and c.get("loc") == (b.get("loc") or None)}
+                body_vals = {}
+                for key, val in values.items():
+                    c = ctrls.get(key)
+                    if not c:
+                        return self._send(400, {"error": tr("الجهاز ده مش بيقبل الأمر ده", "This device doesn't accept that command")})
+                    if c["type"] == "range":
+                        val = float(val)
+                        if not (c["min"] is None or c["min"] <= val <= c["max"]):
+                            return self._send(400, {"error": tr("القيمة برّه المسموح", "Value out of range")})
+                        val = int(val) if val == int(val) else val
+                    elif c["type"] == "boolean":
+                        val = bool(val)
+                    elif val not in c.get("values", []):
+                        return self._send(400, {"error": tr("قيمة مش مسموحة", "Value not allowed")})
+                    body_vals[key] = val
+                    unit, loc = c.get("unit"), c.get("loc")
+                body = {b.get("res"): body_vals}
+                if loc:
+                    body[b.get("res")]["locationName"] = loc
+                if unit:
+                    body[b.get("res")]["unit"] = unit
                 try:
                     thinq_call("POST", "devices/%s/control" % did, body, extra={"x-conditional-control": "true"})
                 except ThinQError as e:
@@ -2407,6 +2579,9 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .dev.on .pilot::after{inset-inline-start:28px;background:var(--on);box-shadow:0 0 12px #3ddc97aa}
 .dev.off .pilot{border-color:#f06a6a66}
 .dev.off .pilot::after{background:var(--off);box-shadow:0 0 10px #f06a6a66}
+.pilot.is-on{background:var(--on-d);border-color:#3ddc9766}.pilot.is-on::after{inset-inline-start:28px;background:var(--on);box-shadow:0 0 12px #3ddc97aa}
+.pilot.is-off{border-color:#f06a6a66}.pilot.is-off::after{background:var(--off);box-shadow:0 0 10px #f06a6a66}
+.kp,.mrow,.colors{direction:ltr}
 .facts{display:flex;flex-wrap:wrap;gap:6px}
 .fact{background:var(--raise);border-radius:10px;padding:7px 10px;min-width:0}
 .fact small{display:block;color:var(--muted);font-size:11.5px}
@@ -2421,9 +2596,9 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .tv-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .tv-row .ibtn{padding:7px 10px}
 .dev details{font-size:13px;color:var(--muted)}
-.dev details summary{cursor:pointer;font-size:12.5px}
-.dev details .kv{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-top:1px solid var(--line)}
-.dev details .kv b{color:var(--text);font-weight:500;text-align:end}
+.dev details summary,.dlg details summary{cursor:pointer;font-size:12.5px}
+.dev details .kv,.dlg details .kv{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-top:1px solid var(--line)}
+.dev details .kv b,.dlg details .kv b{color:var(--text);font-weight:500;text-align:end}
 .dev-err{font-size:12.5px;color:#ffb0b0;background:var(--off-d);border-radius:9px;padding:7px 10px}
 .found{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;background:var(--raise);border-radius:12px;margin-top:8px}
 .found b{font-weight:500}
@@ -2434,6 +2609,84 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .inline input{flex:1;min-width:140px}
 .pairbox{margin-top:10px;padding:12px 14px;border-radius:12px;background:var(--copper-d);color:#f2c48a;font-size:13.5px;line-height:1.7}
 .pairbox.ok{background:var(--on-d);color:#a9ecd0}.pairbox.err{background:var(--off-d);color:#ffb0b0}
+.dev .sub2{font-size:12.5px;color:var(--muted);display:flex;align-items:center;gap:6px;min-width:0}
+.dev .sub2 span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.now{display:flex;align-items:center;gap:10px;background:var(--raise);border-radius:12px;padding:8px 10px}
+.now img,.now .ph{width:34px;height:34px;border-radius:8px;object-fit:cover;background:var(--raise2);flex:none;display:grid;place-items:center;color:var(--muted)}
+.now b{font-weight:500;font-size:14px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.now small{color:var(--muted);font-size:12px}
+.vol{display:flex;align-items:center;gap:10px}
+.vol input[type=range]{flex:1;accent-color:var(--copper);height:4px}
+.vol b{min-width:28px;text-align:center;font-weight:500}
+.iconbtn{width:36px;height:36px;border-radius:10px;border:1px solid var(--line);background:var(--raise);color:var(--text);display:grid;place-items:center;flex:none}
+.iconbtn:hover{border-color:var(--line2)}
+.iconbtn.on{background:var(--copper-d);border-color:#6b4d22;color:#f2c48a}
+.approw{display:flex;gap:8px;overflow-x:auto;padding-bottom:2px;scrollbar-width:thin}
+.appb{flex:none;width:58px;display:flex;flex-direction:column;align-items:center;gap:4px;border:0;background:none;color:var(--muted);font-size:11px;padding:0}
+.appb img,.appb .ph{width:52px;height:52px;border-radius:13px;object-fit:cover;background:var(--raise2);display:grid;place-items:center;border:1px solid var(--line);transition:transform .1s}
+.appb:hover img,.appb:hover .ph{border-color:var(--line2)}
+.appb:active img{transform:scale(.94)}
+.appb span{max-width:58px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.appb.cur img,.appb.cur .ph{border-color:var(--copper)}
+.dev-acts{display:flex;gap:8px;flex-wrap:wrap}
+.dev-acts .btn{flex:1}
+/* remote */
+.dlg.remote{max-width:420px;padding:18px}
+.rm-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px}
+.rm-top .tx{min-width:0}
+.rm-top b{display:block;font-size:17px;font-weight:600}
+.rm-top small{color:var(--muted);font-size:12.5px}
+.rm-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:14px}
+.rm-row .sel{max-width:none;flex:1}
+.dpad{direction:ltr;position:relative;width:228px;height:228px;margin:6px auto 16px;border-radius:50%;background:radial-gradient(circle at 50% 40%,#223040,#18212c 70%);box-shadow:inset 0 2px 0 #ffffff10,0 10px 30px #0006}
+.dpad button{position:absolute;border:0;background:none;color:var(--text);display:grid;place-items:center;border-radius:12px}
+.dpad button:active,.rk button:active,.kp button:active,.mrow button:active{transform:scale(.94)}
+.dpad .u{top:8px;left:84px;width:60px;height:52px}.dpad .d{bottom:8px;left:84px;width:60px;height:52px}
+.dpad .l{left:8px;top:84px;width:52px;height:60px}.dpad .r{right:8px;top:84px;width:52px;height:60px}
+.dpad .ok{left:64px;top:64px;width:100px;height:100px;border-radius:50%;background:var(--copper);color:#1d1408;font-weight:700;font-size:17px;box-shadow:0 4px 18px #e0a45840}
+.dpad button:hover:not(.ok){background:#ffffff0a}
+.rm-keys{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
+.rm-keys button{border:1px solid var(--line);background:var(--raise);border-radius:12px;padding:9px 4px;font-size:12.5px;display:flex;flex-direction:column;align-items:center;gap:4px;color:var(--text)}
+.rm-keys button:hover{border-color:var(--line2)}
+.rockers{display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:center;margin-bottom:14px}
+.rk{display:flex;flex-direction:column;align-items:center;background:var(--raise);border-radius:24px;border:1px solid var(--line);overflow:hidden}
+.rk button{width:100%;border:0;background:none;color:var(--text);padding:12px 0;font-size:20px}
+.rk button:hover{background:#ffffff08}
+.rk span{font-size:11.5px;color:var(--muted);padding:2px 0}
+.mrow{display:flex;justify-content:center;gap:8px;margin-bottom:14px}
+.mrow button{width:46px;height:40px;border-radius:12px;border:1px solid var(--line);background:var(--raise);color:var(--text);display:grid;place-items:center}
+.colors{display:flex;gap:8px;margin-bottom:14px}
+.colors button{flex:1;height:10px;border:0;border-radius:6px;padding:8px 0;box-sizing:content-box}
+.kp{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.kp button{border:1px solid var(--line);background:var(--raise);border-radius:12px;padding:12px 0;font-size:18px;font-weight:500;color:var(--text)}
+.apps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(70px,1fr));gap:12px 6px;max-height:300px;overflow:auto;padding:4px 2px}
+.apps-grid .appb{width:auto}
+.rm-hint{font-size:12px;color:var(--faint);text-align:center;margin-top:12px}
+/* appliances */
+.thermo{display:flex;align-items:center;justify-content:center;gap:18px;padding:6px 0}
+.thermo .rd{width:44px;height:44px;border-radius:50%;border:1px solid var(--line2);background:var(--raise);color:var(--text);font-size:22px;display:grid;place-items:center}
+.thermo .rd:hover:not(:disabled){border-color:var(--copper)}
+.thermo .rd:disabled{opacity:.35;cursor:not-allowed}
+.thermo .big{text-align:center;min-width:110px}
+.thermo .big b{display:block;font-size:46px;font-weight:300;line-height:1;letter-spacing:-.02em}
+.thermo .big small{color:var(--muted);font-size:12.5px}
+.room-t{text-align:center;color:var(--muted);font-size:13px;margin-top:-4px}
+.chips2{display:flex;gap:6px;flex-wrap:wrap}
+.chips2 button{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--raise);border-radius:11px;padding:7px 11px;font-size:13px;color:var(--muted)}
+.chips2 button:hover:not(:disabled){color:var(--text);border-color:var(--line2)}
+.chips2 button.on{background:var(--copper-d);border-color:#6b4d22;color:#f2c48a}
+.chips2 button:disabled{opacity:.4;cursor:not-allowed}
+.lbl2{font-size:12.5px;color:var(--muted);margin-bottom:6px}
+.prog{height:10px;border-radius:9px;background:var(--raise2);overflow:hidden}
+.prog i{display:block;height:100%;background:linear-gradient(90deg,var(--copper),#f2c48a);border-radius:9px;transition:width .6s}
+.wash{display:flex;justify-content:space-between;align-items:flex-end;gap:10px}
+.wash b{font-size:22px;font-weight:500}
+.wash small{color:var(--muted);font-size:12.5px;display:block}
+.locrow{display:flex;justify-content:space-between;align-items:center;gap:10px;background:var(--raise);border-radius:12px;padding:8px 10px}
+.locrow b{font-weight:500}
+.dlg .ctl{padding:10px 0;border-top:1px solid var(--line)}
+.dlg .ctl:first-of-type{border-top:0}
+.dlg .ctl.col{flex-direction:column;align-items:stretch}
 .price input{width:110px}
 .ap{display:grid;grid-template-columns:40px minmax(0,1fr) auto;gap:14px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}
 .ap:first-of-type{border-top:0}
@@ -2649,6 +2902,15 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
   </div>
 </div>
 
+<!-- TV remote -->
+<div class="modal" id="m-remote" onclick="if(event.target===this)closeM('m-remote')">
+  <div class="dlg remote" role="dialog" aria-modal="true" id="remote-body"></div>
+</div>
+<!-- LG appliance details -->
+<div class="modal" id="m-dev" onclick="if(event.target===this)closeM('m-dev')">
+  <div class="dlg" role="dialog" aria-modal="true" id="dev-body"></div>
+</div>
+
 <!-- timer dialog -->
 <div class="modal" id="m-timer" onclick="if(event.target===this)closeM('m-timer')">
   <div class="dlg" role="dialog" aria-modal="true">
@@ -2798,6 +3060,11 @@ ar:{
  pat:'التوكن (Personal Access Token)',country:'الدولة',connect:'اربط',connecting:'بتصل…',disconnect:'افصل',refreshNow:'حدّث',
  thinqOk:'متصل — {0} جهاز',thinqNone:'مش متصل',thinqErr:'آخر خطأ: {0}',confirmDisc:'تفصل حساب LG ThinQ؟',
  devOffline:'الجهاز مش متصل بالإنترنت',allReadings:'كل القراءات',remain:'الوقت الباقي',
+ remote:'الريموت',screenOff:'اقفل الشاشة',screenOn:'افتح الشاشة',screenOffNow:'الشاشة مقفولة والصوت شغال',apps:'التطبيقات',numbers:'الأرقام',typeText:'كتابة',send:'ابعت',
+ searchApps:'دوّر على تطبيق',btnBack:'رجوع',btnHome:'الرئيسية',btnMenu:'الإعدادات',btnInfo:'معلومات',btnExit:'خروج',btnGuide:'الدليل',
+ kbHint:'على اللاب: الأسهم وEnter وBackspace والـ + و− شغالين كريموت',channelNow:'قناة {0}',textPh:'اكتب هنا وابعته للتلفزيون (مثلاً بحث في يوتيوب)',
+ more:'المزيد',target:'المطلوبة',roomT:'الغرفة دلوقتي {0}°',fanSpeed:'سرعة الهوا',modeL:'الوضع',autoOffIn:'هيطفي بعد {0}',offAfterL:'اطفي بعد',hShort:'{0} س',
+ progressOf:'من {0}',locs:{FRIDGE:'الثلاجة',FREEZER:'الفريزر',CONVERTIBLE:'الدرج المتحول',MAIN:'الرئيسي',KIMCHI:'الكيمتشي'},noControls:'الجهاز ده مش بيقبل أوامر من بره، بيعرض حالته بس.',
  langTitle:'اللغة',langLead:'لغة البرنامج والرسايل والسجل.',error:'حصل خطأ',
  types:{tv:'تلفزيون',heater:'سخان',ac:'تكييف',fridge:'تلاجة',washer:'غسالة',kettle:'غلاية',lamp:'إضاءة',fan:'مروحة',router:'راوتر',charger:'شاحن',pc:'كمبيوتر',pump:'موتور مياه',other:'تاني'},
  rooms:['الصالة','المطبخ','أوضة النوم','أوضة الأطفال','الحمام','المكتب','البلكونة'],
@@ -2866,6 +3133,11 @@ en:{
  pat:'Token (Personal Access Token)',country:'Country',connect:'Connect',connecting:'Connecting…',disconnect:'Disconnect',refreshNow:'Refresh',
  thinqOk:'Connected — {0} devices',thinqNone:'Not connected',thinqErr:'Last error: {0}',confirmDisc:'Disconnect your LG ThinQ account?',
  devOffline:'Device is offline',allReadings:'All readings',remain:'Time left',
+ remote:'Remote',screenOff:'Screen off',screenOn:'Screen on',screenOffNow:'Screen is off, sound still playing',apps:'Apps',numbers:'Numbers',typeText:'Type',send:'Send',
+ searchApps:'Search apps',btnBack:'Back',btnHome:'Home',btnMenu:'Settings',btnInfo:'Info',btnExit:'Exit',btnGuide:'Guide',
+ kbHint:'On a computer: arrows, Enter, Backspace and + / − work as the remote',channelNow:'Channel {0}',textPh:'Type here and send it to the TV (e.g. a YouTube search)',
+ more:'More',target:'Target',roomT:'Room is {0}°',fanSpeed:'Fan speed',modeL:'Mode',autoOffIn:'Turns off in {0}',offAfterL:'Off after',hShort:'{0} h',
+ progressOf:'of {0}',locs:{FRIDGE:'Fridge',FREEZER:'Freezer',CONVERTIBLE:'Convertible',MAIN:'Main',KIMCHI:'Kimchi'},noControls:'This device only reports its status; it doesn\'t accept remote commands.',
  langTitle:'Language',langLead:'Language for the app, messages and activity log.',error:'Something went wrong',
  types:{tv:'TV',heater:'Water heater',ac:'Air con',fridge:'Fridge',washer:'Washer',kettle:'Kettle',lamp:'Lights',fan:'Fan',router:'Router',charger:'Charger',pc:'Computer',pump:'Water pump',other:'Other'},
  rooms:['Living room','Kitchen','Bedroom','Kids room','Bathroom','Office','Balcony'],
@@ -2935,7 +3207,7 @@ async function refresh(){
   else w.style.display='none';
   render();renderLog();
 }
-function render(){if(!S||editing)return;if(curTab==='home'){renderHome();renderLG()}if(curTab==='settings')renderLGSettings();if(curTab==='sched')renderSched();if(curTab==='energy'&&Date.now()-EN_AT>60000&&(EN.mode!=='custom'))loadEnergy()}
+function render(){if(!S)return;if($('m-remote').classList.contains('on'))drawRemote(false);if($('m-dev').classList.contains('on'))drawDev();if(editing)return;if(curTab==='home'){renderHome();renderLG()}if(curTab==='settings')renderLGSettings();if(curTab==='sched')renderSched();if(curTab==='energy'&&Date.now()-EN_AT>60000&&(EN.mode!=='custom'))loadEnergy()}
 
 /* ---------------- home ---------------- */
 let VIEW=(()=>{try{return localStorage.getItem('mttl_view')||'strip'}catch(e){return 'strip'}})();
@@ -3033,7 +3305,7 @@ function closeM(id){$(id).classList.remove('on')}
 function segVal(id){return $(id).querySelector('.on').dataset.v}
 function segSet(id,v){$(id).querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===v))}
 function segBind(id,cb){$(id).querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{segSet(id,b.dataset.v);cb&&cb(b.dataset.v)}))}
-document.addEventListener('keydown',e=>{if(e.key==='Escape')['m-timer','m-rule','m-outlet'].forEach(closeM)});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')['m-timer','m-rule','m-outlet','m-remote','m-dev'].forEach(closeM)});
 
 let OL={};
 function openOutlet(mac,n){
@@ -3186,10 +3458,10 @@ async function savePrice(){try{await api('/api/price',{price:+$('en-price').valu
 /* ---------------- LG ---------------- */
 const LGT={
  ar:{types:{DEVICE_AIR_CONDITIONER:'تكييف',DEVICE_WASHER:'غسالة',DEVICE_DRYER:'نشافة',DEVICE_REFRIGERATOR:'تلاجة',DEVICE_AIR_PURIFIER:'منقي هوا',DEVICE_DISH_WASHER:'غسالة أطباق',DEVICE_WATER_HEATER:'سخان',DEVICE_OVEN:'فرن',DEVICE_MICROWAVE_OVEN:'ميكروويف',DEVICE_DEHUMIDIFIER:'مزيل رطوبة',DEVICE_HUMIDIFIER:'مرطب هوا',DEVICE_ROBOT_CLEANER:'مكنسة روبوت',DEVICE_STYLER:'ستايلر',DEVICE_WASHTOWER:'واش تاور',DEVICE_CEILING_FAN:'مروحة سقف',DEVICE_WATER_PURIFIER:'فلتر مياه'},
-  keys:{airConOperationMode:'التشغيل',airPurifierOperationMode:'التشغيل',airCleanOperationMode:'تنقية الهوا',currentJobMode:'الوضع',targetTemperature:'الحرارة المطلوبة',currentTemperature:'الحرارة دلوقتي',coolTargetTemperature:'حرارة التبريد',heatTargetTemperature:'حرارة التدفئة',windStrength:'سرعة الهوا',windStep:'سرعة الهوا',currentState:'الحالة',washerOperationMode:'أمر الغسالة',dryerOperationMode:'أمر النشافة',powerSaveEnabled:'توفير الطاقة',doorState:'الباب',humidity:'الرطوبة',expressMode:'تبريد سريع',rapidFreeze:'تجميد سريع',remoteControlEnabled:'التحكم عن بعد',rotateUpDown:'تحريك فوق وتحت',rotateLeftRight:'تحريك يمين وشمال',light:'النور',display:'الشاشة',totalHour:'إجمالي الساعات',totalMinute:'إجمالي الدقايق',remainHour:'ساعات باقية',remainMinute:'دقايق باقية',cycleCount:'عدد الدورات',PM1:'PM1',PM2:'PM2.5',PM10:'PM10',totalPollutionLevel:'جودة الهوا',filterRemainPercent:'عمر الفلتر'},
+  keys:{airConOperationMode:'التشغيل',airPurifierOperationMode:'التشغيل',airCleanOperationMode:'تنقية الهوا',currentJobMode:'الوضع',targetTemperature:'الحرارة المطلوبة',currentTemperature:'الحرارة دلوقتي',coolTargetTemperature:'حرارة التبريد',heatTargetTemperature:'حرارة التدفئة',windStrength:'سرعة الهوا',windStep:'سرعة الهوا',currentState:'الحالة',washerOperationMode:'أمر الغسالة',dryerOperationMode:'أمر النشافة',powerSaveEnabled:'توفير الطاقة',doorState:'الباب',humidity:'الرطوبة',expressMode:'تبريد سريع',rapidFreeze:'تجميد سريع',remoteControlEnabled:'التحكم عن بعد',rotateUpDown:'تحريك فوق وتحت',rotateLeftRight:'تحريك يمين وشمال',light:'النور',display:'الشاشة',totalHour:'إجمالي الساعات',totalMinute:'إجمالي الدقايق',remainHour:'ساعات باقية',remainMinute:'دقايق باقية',cycleCount:'عدد الدورات',PM1:'PM1',PM2:'PM2.5',PM10:'PM10',totalPollutionLevel:'جودة الهوا',filterRemainPercent:'عمر الفلتر',relativeHourToStop:'ساعات لحد الإطفاء',relativeMinuteToStop:'دقايق لحد الإطفاء',relativeHourToStart:'ساعات لحد التشغيل',relativeMinuteToStart:'دقايق لحد التشغيل',targetTemperatureC:'الحرارة المطلوبة',totalHour:'المدة (ساعات)',totalMinute:'المدة (دقايق)',currentCourse:'البرنامج'},
   vals:{POWER_ON:'شغال',POWER_OFF:'مقفول',COOL:'تبريد',HEAT:'تدفئة',FAN:'مروحة',AUTO:'تلقائي',AIR_DRY:'تجفيف',AIR_CLEAN:'تنقية',ENERGY_SAVING:'توفير',LOW:'هادي',MID:'متوسط',HIGH:'عالي',SLOW:'بطيء',FAST:'سريع',POWER:'قوي',NATURE:'طبيعي',RUNNING:'شغالة',END:'خلصت',PAUSE:'واقفة مؤقتاً',INITIAL:'جاهزة',DETECTING:'بتقيس الحمولة',RINSING:'شطف',SPINNING:'عصر',DRYING:'تجفيف',COOLING:'تبريد',RESERVED:'متأجلة',SLEEP:'نوم',ERROR:'عطل',START:'ابدأ',STOP:'وقف',WAKE_UP:'صحّي',OPEN:'مفتوح',CLOSE:'مقفول',GOOD:'كويس',NORMAL:'عادي',BAD:'وحش',VERY_BAD:'وحش جداً',true:'شغال',false:'مقفول'}},
  en:{types:{DEVICE_AIR_CONDITIONER:'Air conditioner',DEVICE_WASHER:'Washer',DEVICE_DRYER:'Dryer',DEVICE_REFRIGERATOR:'Fridge',DEVICE_AIR_PURIFIER:'Air purifier',DEVICE_DISH_WASHER:'Dishwasher',DEVICE_WATER_HEATER:'Water heater',DEVICE_OVEN:'Oven',DEVICE_MICROWAVE_OVEN:'Microwave',DEVICE_DEHUMIDIFIER:'Dehumidifier',DEVICE_HUMIDIFIER:'Humidifier',DEVICE_ROBOT_CLEANER:'Robot vacuum',DEVICE_STYLER:'Styler',DEVICE_WASHTOWER:'WashTower',DEVICE_CEILING_FAN:'Ceiling fan',DEVICE_WATER_PURIFIER:'Water purifier'},
-  keys:{airConOperationMode:'Power',airPurifierOperationMode:'Power',airCleanOperationMode:'Air cleaning',currentJobMode:'Mode',targetTemperature:'Target temperature',currentTemperature:'Current temperature',coolTargetTemperature:'Cooling target',heatTargetTemperature:'Heating target',windStrength:'Fan speed',windStep:'Fan speed',currentState:'Status',washerOperationMode:'Washer command',dryerOperationMode:'Dryer command',powerSaveEnabled:'Power save',doorState:'Door',humidity:'Humidity',expressMode:'Express cool',rapidFreeze:'Rapid freeze',remoteControlEnabled:'Remote control',rotateUpDown:'Swing up/down',rotateLeftRight:'Swing left/right',light:'Light',display:'Display',remainHour:'Hours left',remainMinute:'Minutes left',cycleCount:'Cycles',totalPollutionLevel:'Air quality',filterRemainPercent:'Filter life'},
+  keys:{airConOperationMode:'Power',airPurifierOperationMode:'Power',airCleanOperationMode:'Air cleaning',currentJobMode:'Mode',targetTemperature:'Target temperature',currentTemperature:'Current temperature',coolTargetTemperature:'Cooling target',heatTargetTemperature:'Heating target',windStrength:'Fan speed',windStep:'Fan speed',currentState:'Status',washerOperationMode:'Washer command',dryerOperationMode:'Dryer command',powerSaveEnabled:'Power save',doorState:'Door',humidity:'Humidity',expressMode:'Express cool',rapidFreeze:'Rapid freeze',remoteControlEnabled:'Remote control',rotateUpDown:'Swing up/down',rotateLeftRight:'Swing left/right',light:'Light',display:'Display',remainHour:'Hours left',remainMinute:'Minutes left',cycleCount:'Cycles',totalPollutionLevel:'Air quality',filterRemainPercent:'Filter life',relativeHourToStop:'Hours until off',relativeMinuteToStop:'Minutes until off',relativeHourToStart:'Hours until on',relativeMinuteToStart:'Minutes until on',targetTemperatureC:'Target temperature',totalHour:'Total hours',totalMinute:'Total minutes',currentCourse:'Cycle'},
   vals:{POWER_ON:'On',POWER_OFF:'Off',COOL:'Cool',HEAT:'Heat',FAN:'Fan',AUTO:'Auto',AIR_DRY:'Dry',AIR_CLEAN:'Clean',ENERGY_SAVING:'Eco',LOW:'Low',MID:'Medium',HIGH:'High',RUNNING:'Running',END:'Finished',PAUSE:'Paused',INITIAL:'Ready',DETECTING:'Detecting load',RINSING:'Rinsing',SPINNING:'Spinning',DRYING:'Drying',COOLING:'Cooling',RESERVED:'Delayed start',ERROR:'Error',START:'Start',STOP:'Stop',WAKE_UP:'Wake up',OPEN:'Open',CLOSE:'Closed',true:'On',false:'Off'}}};
 const LGCMD={ar:{POWER_OFF:'اقفل',POWER_ON:'شغّل',START:'ابدأ',STOP:'وقّف',WAKE_UP:'صحّي'},en:{POWER_OFF:'Power off',POWER_ON:'Power on',START:'Start',STOP:'Stop',WAKE_UP:'Wake up'}};
 const lgCmdLabel=v=>LGCMD[LANG][v]||lgVal(v);
@@ -3200,40 +3472,142 @@ const lgType=t_=>LGT[LANG].types[t_]||pretty(String(t_).replace('DEVICE_',''));
 function lgIcon(t_){t_=t_||'';return t_.includes('AIR_CONDITIONER')?'ac':/WASH|DRYER|STYLER/.test(t_)?'washer':/REFRIGERATOR|WINE|KIMCHI/.test(t_)?'fridge':/PURIFIER|FAN|HUMIDIFIER|VENTILATOR/.test(t_)?'fan':/HEATER|BOILER/.test(t_)?'heater':/OVEN|COOK|HOOD|BREW/.test(t_)?'kettle':'other'}
 const stVal=(d,res,key)=>{const x=d.state.find(s_=>s_.res===res&&s_.key===key)||d.state.find(s_=>s_.key===key);return x?x.value:undefined};
 
+const IC2={
+ back:'<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>',
+ home:'<path d="M3 11l9-7.5L21 11"/><path d="M5.5 9.5V20h13V9.5"/>',
+ gear:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+ info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+ exit:'<path d="M15 4h4v16h-4M10 17l5-5-5-5M15 12H4"/>',
+ guide:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v16"/>',
+ up:'<path d="M6 15l6-6 6 6"/>',down:'<path d="M6 9l6 6 6-6"/>',left:'<path d="M15 6l-6 6 6 6"/>',right:'<path d="M9 6l6 6-6 6"/>',
+ rew:'<path d="M11 6L4 12l7 6zM20 6l-7 6 7 6z"/>',ff:'<path d="M13 6l7 6-7 6zM4 6l7 6-7 6z"/>',play:'<path d="M7 5v14l11-7z"/>',pause:'<path d="M8 5v14M16 5v14"/>',stop:'<rect x="6" y="6" width="12" height="12" rx="1.5"/>',
+ mute:'<path d="M11 5L6 9H3v6h3l5 4zM22 9l-6 6M16 9l6 6"/>',vol:'<path d="M11 5L6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/>',
+ screen:'<rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M4 4l16 13"/>',remote:'<rect x="7" y="2" width="10" height="20" rx="3"/><circle cx="12" cy="8" r="2"/><path d="M10 14h.01M14 14h.01M10 17h.01M14 17h.01"/>',
+ auto:'<circle cx="12" cy="12" r="9"/><path d="M8.5 16l3.5-8 3.5 8M9.7 13.5h4.6"/>',leaf:'<path d="M5 19c0-8 6-14 15-14-1 9-6 15-14 15"/><path d="M5 19l7-7"/>',
+};
+const appImg=(tv,a)=>a&&a.icon?`<img src="/api/tv/icon?id=${encodeURIComponent(tv.id)}&app=${encodeURIComponent(a.id)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'ph',textContent:'${esc((a.title||'?')[0])}'}))">`:`<span class="ph">${esc(((a&&a.title)||'?')[0])}</span>`;
+function tvNowLine(tv){if(tv.screen_off)return t('screenOffNow');if(tv.channel&&tv.channel.number)return t('channelNow',tv.channel.number+(tv.channel.name?' — '+tv.channel.name:''));return tv.app_title||tv.app||''}
+
 function tvCard(tv){
-  const st=tv.on===true?'on':tv.on===false?'off':'';
+  const st=tv.on===true?'on':tv.on===false?'off':'',cur=tv.apps.find(a=>a.id===tv.app);
+  const quick=tv.apps.slice(0,8);
   return `<div class="dev ${st}"><div class="dev-h"><div class="ico">${tIco('tv',22)}</div>
     <div class="tx"><b>${esc(tv.name)}</b><small>${tv.on?t('tvOn'):tv.on===false?t('tvOff'):t('tvUnknown')}${tv.model?t('sep')+esc(tv.model):''}</small></div>
     <button class="pilot" aria-pressed="${!!tv.on}" aria-label="${esc(tv.name)}" ${!tv.on&&!tv.mac?'disabled title="'+t('noMac')+'"':''} onclick="tvCmd('${tv.id}','${tv.on?'power_off':'power_on'}')"></button></div>
-    ${tv.on?`<div class="ctl"><span>${t('volume')}</span><div class="stepper"><button onclick="tvCmd('${tv.id}','vol_down')" aria-label="-">−</button><b class="ltr">${tv.muted?'🔇':tv.volume??'—'}</b><button onclick="tvCmd('${tv.id}','vol_up')" aria-label="+">+</button></div></div>
-      <div class="ctl"><span>${t('channel')}</span><div class="stepper"><button onclick="tvCmd('${tv.id}','ch_down')" aria-label="-">−</button><b>${sv('<rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 3l4 4 4-4"/>',16)}</b><button onclick="tvCmd('${tv.id}','ch_up')" aria-label="+">+</button></div></div>
-      <div class="tv-row"><button class="ibtn" onclick="tvCmd('${tv.id}','mute',${!tv.muted})">${tv.muted?t('unmute'):t('mute')}</button>
-        ${tv.inputs.length?`<select class="sel" onchange="if(this.value)tvCmd('${tv.id}','input',this.value)"><option value="">${t('chooseInput')}</option>${tv.inputs.map(i=>`<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`:''}</div>
-      ${tv.app?`<div class="hint" style="margin:0">${t('nowApp',esc(tv.app.replace(/^com\.webos\.app\./,'')))}</div>`:''}`
+    ${tv.on?`
+      ${tvNowLine(tv)?`<div class="now">${tv.channel&&tv.channel.number?`<span class="ph">${sv(TYPE_P.tv,18)}</span>`:appImg(tv,cur)}<div style="min-width:0"><b>${esc(tvNowLine(tv))}</b></div></div>`:''}
+      <div class="vol"><button class="iconbtn ${tv.muted?'on':''}" title="${t(tv.muted?'unmute':'mute')}" onclick="tvCmd('${tv.id}','mute',${!tv.muted})">${sv(tv.muted?IC2.mute:IC2.vol,17)}</button>
+        <input type="range" min="0" max="100" value="${tv.volume??0}" aria-label="${t('volume')}" onpointerdown="editing=true" oninput="this.nextElementSibling.textContent=this.value" onchange="editing=false;tvCmd('${tv.id}','volume',+this.value)"><b class="ltr">${tv.volume??'—'}</b></div>
+      ${quick.length?`<div class="approw">${quick.map(a=>`<button class="appb ${a.id===tv.app?'cur':''}" title="${esc(a.title)}" onclick="tvCmd('${tv.id}','launch','${esc(a.id)}')">${appImg(tv,a)}<span>${esc(a.title)}</span></button>`).join('')}</div>`:''}
+      <div class="dev-acts"><button class="btn primary sm" onclick="openRemote('${tv.id}')">${sv(IC2.remote,16)}${t('remote')}</button><button class="btn sm" onclick="tvCmd('${tv.id}','${tv.screen_off?'screen_on':'screen_off'}')">${sv(IC2.screen,16)}${t(tv.screen_off?'screenOn':'screenOff')}</button></div>`
     :(!tv.mac?`<div class="hint" style="margin:0">${t('noMac')}</div>`:'')}
   </div>`;
 }
-function thinqCard(d){
-  const power=d.controls.find(c=>c.type==='enum'&&c.values.includes('POWER_ON')&&c.values.includes('POWER_OFF'));
-  const pv=power?stVal(d,power.res,power.key):undefined, isOn=pv==='POWER_ON';
-  const facts=[];
-  const ctlKeys=new Set(d.controls.map(c=>c.key));
-  ['currentState','currentTemperature','targetTemperature','currentJobMode','humidity'].forEach(k=>{const v=stVal(d,null,k);if(v!==undefined&&v!==null&&!ctlKeys.has(k))facts.push([k,v])});
-  const rh=stVal(d,null,'remainHour'),rm=stVal(d,null,'remainMinute');
-  if(rh!==undefined||rm!==undefined)facts.push(['remain',(rh||0)+':'+two(rm||0)]);
-  const ctls=d.controls.filter(c=>c!==power).map(c=>{const cur=stVal(d,c.res,c.key);const id=`'${d.id}','${c.res}','${c.key}'`;
-    if(c.type==='range'){const v=+(cur??c.min);return `<div class="ctl"><span>${lgKey(c.key)}</span><div class="stepper"><button ${v<=c.min?'disabled':''} onclick="lgCtl(${id},${v-c.step})" aria-label="-">−</button><b class="ltr">${cur??'—'}${/emperature/i.test(c.key)?'°':''}</b><button ${v>=c.max?'disabled':''} onclick="lgCtl(${id},${v+c.step})" aria-label="+">+</button></div></div>`}
-    if(c.type==='enum'&&cur===undefined&&c.values.length<=4)return `<div class="ctl"><span>${lgKey(c.key)}</span><div class="tv-row">${c.values.map(v=>`<button class="ibtn" ${d.online?'':'disabled'} onclick="lgCtl(${id},'${esc(v)}')">${esc(lgCmdLabel(v))}</button>`).join('')}</div></div>`;
-    if(c.type==='boolean')return `<div class="ctl"><span>${lgKey(c.key)}</span><label class="switch"><input type="checkbox" ${cur?'checked':''} onchange="lgCtl(${id},this.checked)"><span></span></label></div>`;
-    return `<div class="ctl"><span>${lgKey(c.key)}</span><select class="sel" onchange="lgCtl(${id},this.value)">${cur===undefined?'<option></option>':''}${c.values.map(v=>`<option value="${esc(v)}" ${v===cur?'selected':''}>${esc(lgVal(v))}</option>`).join('')}</select></div>`}).join('');
-  return `<div class="dev ${power?(isOn?'on':'off'):''}"><div class="dev-h"><div class="ico">${tIco(lgIcon(d.type),22)}</div>
+
+/* ---- remote ---- */
+let RM=null,RM_TAB='keys',RM_Q='';
+function openRemote(id){RM=id;RM_TAB='keys';RM_Q='';drawRemote(true);openM('m-remote')}
+function rmBtn(name){const tv=S.lg.tvs.find(x=>x.id===RM);if(!tv)return;api('/api/tv/cmd',{id:RM,cmd:'button',value:name}).catch(e=>toast(e.message,1))}
+function drawRemote(full){
+  const tv=S&&S.lg.tvs.find(x=>x.id===RM),box=$('remote-body');if(!tv||!box)return;
+  const head=`<div class="rm-top"><div class="tx"><b>${esc(tv.name)}</b><small id="rm-now">${esc(tv.on?tvNowLine(tv)||t('tvOn'):t('tvOff'))}</small></div>
+    <div style="display:flex;gap:6px"><button class="pilot ${tv.on?'is-on':'is-off'}" aria-pressed="${!!tv.on}" ${!tv.on&&!tv.mac?'disabled':''} onclick="tvCmd('${tv.id}','${tv.on?'power_off':'power_on'}')"></button>
+    <button class="iconbtn" aria-label="${t('cancel')}" onclick="closeM('m-remote')">${sv('<path d="M6 6l12 12M18 6L6 18"/>',16)}</button></div></div>`;
+  if(!full){const n=$('rm-now');if(n)n.textContent=tv.on?tvNowLine(tv)||t('tvOn'):t('tvOff');const v=$('rm-vol');if(v&&document.activeElement!==v){v.value=tv.volume??0;$('rm-volv').textContent=tv.volume??'—'}return}
+  const K=(name,ic,label)=>`<button onclick="rmBtn('${name}')">${sv(ic,18)}<span>${label}</span></button>`;
+  let tabBody='';
+  if(RM_TAB==='keys')tabBody=`<div class="kp">${['1','2','3','4','5','6','7','8','9'].map(n=>`<button onclick="rmBtn('${n}')">${n}</button>`).join('')}<button onclick="rmBtn('DASH')">–</button><button onclick="rmBtn('0')">0</button><button onclick="rmBtn('ENTER')" style="font-size:14px">OK</button></div>
+    <div class="colors" style="margin-top:12px">${['RED:#e5484d','GREEN:#30a46c','YELLOW:#f5d90a','BLUE:#3e63dd'].map(x=>{const [n,c]=x.split(':');return `<button aria-label="${n}" style="background:${c}" onclick="rmBtn('${n}')"></button>`}).join('')}</div>`;
+  if(RM_TAB==='apps'){const q=RM_Q.toLowerCase(),list=tv.apps.filter(a=>!q||a.title.toLowerCase().includes(q));
+    tabBody=`<input type="text" placeholder="${t('searchApps')}" value="${esc(RM_Q)}" oninput="RM_Q=this.value;drawRemote(true);const i=$('remote-body').querySelector('input[type=text]');i.focus();i.setSelectionRange(i.value.length,i.value.length)" style="margin-bottom:10px">
+      <div class="apps-grid">${list.map(a=>`<button class="appb ${a.id===tv.app?'cur':''}" onclick="tvCmd('${tv.id}','launch','${esc(a.id)}')">${appImg(tv,a)}<span>${esc(a.title)}</span></button>`).join('')}</div>`}
+  if(RM_TAB==='text')tabBody=`<div class="inline"><input type="text" id="rm-text" placeholder="${t('textPh')}" onkeydown="if(event.key==='Enter'){event.preventDefault();rmSend(true)}"><button class="btn primary sm" onclick="rmSend(false)">${t('send')}</button><button class="btn sm" onclick="tvCmd('${tv.id}','enter')">↵</button></div>`;
+  box.innerHTML=head+(tv.on?`
+    <div class="rm-row">${tv.inputs.length?`<select class="sel" onchange="if(this.value)tvCmd('${tv.id}','input',this.value)"><option value="">${t('chooseInput')}</option>${tv.inputs.map(i=>`<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`:'<span></span>'}
+      <button class="iconbtn ${tv.screen_off?'on':''}" title="${t(tv.screen_off?'screenOn':'screenOff')}" onclick="tvCmd('${tv.id}','${tv.screen_off?'screen_on':'screen_off'}')">${sv(IC2.screen,17)}</button></div>
+    <div class="rm-keys">${K('BACK',IC2.back,t('btnBack'))}${K('HOME',IC2.home,t('btnHome'))}${K('QMENU',IC2.gear,t('btnMenu'))}${K('EXIT',IC2.exit,t('btnExit'))}</div>
+    <div class="dpad"><button class="u" aria-label="UP" onclick="rmBtn('UP')">${sv(IC2.up,26)}</button><button class="l" aria-label="LEFT" onclick="rmBtn('LEFT')">${sv(IC2.left,26)}</button>
+      <button class="ok" onclick="rmBtn('ENTER')">OK</button><button class="r" aria-label="RIGHT" onclick="rmBtn('RIGHT')">${sv(IC2.right,26)}</button><button class="d" aria-label="DOWN" onclick="rmBtn('DOWN')">${sv(IC2.down,26)}</button></div>
+    <div class="rockers"><div class="rk"><button onclick="rmBtn('VOLUMEUP')">+</button><span>${t('volume')}</span><button onclick="rmBtn('VOLUMEDOWN')">−</button></div>
+      <div style="display:flex;flex-direction:column;gap:8px;align-items:center"><button class="iconbtn ${tv.muted?'on':''}" onclick="tvCmd('${tv.id}','mute',${!tv.muted})">${sv(tv.muted?IC2.mute:IC2.vol,17)}</button>
+        <input type="range" id="rm-vol" min="0" max="100" value="${tv.volume??0}" style="width:96px;accent-color:var(--copper)" oninput="$('rm-volv').textContent=this.value" onchange="tvCmd('${tv.id}','volume',+this.value)"><b id="rm-volv" class="ltr" style="font-weight:500">${tv.volume??'—'}</b></div>
+      <div class="rk"><button onclick="rmBtn('CHANNELUP')">+</button><span>${t('channel')}</span><button onclick="rmBtn('CHANNELDOWN')">−</button></div></div>
+    <div class="mrow">${[['REWIND',IC2.rew],['PLAY',IC2.play],['PAUSE',IC2.pause],['STOP',IC2.stop],['FASTFORWARD',IC2.ff]].map(([n,i])=>`<button aria-label="${n}" onclick="rmBtn('${n}')">${sv(i,18)}</button>`).join('')}</div>
+    <div class="seg full" style="margin-bottom:12px">${[['keys','numbers'],['apps','apps'],['text','typeText']].map(([k,l])=>`<button class="${RM_TAB===k?'on':''}" onclick="RM_TAB='${k}';drawRemote(true)">${t(l)}</button>`).join('')}</div>
+    ${tabBody}
+    <p class="rm-hint">${t('kbHint')}</p>`:`<p class="hint">${tv.mac?'':t('noMac')}</p>`);
+}
+async function rmSend(enter){const i=$('rm-text');if(!i||!i.value)return;try{await api('/api/tv/cmd',{id:RM,cmd:'text',value:i.value});if(enter)await api('/api/tv/cmd',{id:RM,cmd:'enter'});i.value='';toast(t('done'))}catch(e){toast(e.message,1)}}
+document.addEventListener('keydown',e=>{
+  if(!$('m-remote').classList.contains('on')||/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName))return;
+  const map={ArrowUp:'UP',ArrowDown:'DOWN',ArrowLeft:'LEFT',ArrowRight:'RIGHT',Enter:'ENTER',Backspace:'BACK','+':'VOLUMEUP','=':'VOLUMEUP','-':'VOLUMEDOWN',m:'MUTE',h:'HOME'};
+  const k=map[e.key];if(k){e.preventDefault();rmBtn(k)}
+});
+
+/* ---- LG appliances ---- */
+const TIMER_RE=/^(relative|absolute)(Hour|Minute)To(Start|Stop)$/;
+const MODE_IC={COOL:TYPE_P.ac,HEAT:TYPE_P.heater,FAN:TYPE_P.fan,AIR_DRY:TYPE_P.pump,AUTO:IC2.auto,AIR_CLEAN:TYPE_P.fan,ENERGY_SAVING:IC2.leaf};
+const locName=l=>t('locs')[l]||pretty(l||'');
+function stLoc(d,res,key,loc){const x=d.state.find(s_=>s_.key===key&&(loc==null||s_.loc===loc)&&(res==null||s_.res===res))||d.state.find(s_=>s_.key===key&&(loc==null||s_.loc===loc));return x?x.value:undefined}
+const ctlJS=(d,c,v)=>`lgCtl('${d.id}','${c.res}','${c.key}',${typeof v==='string'?`'${esc(v)}'`:v},${c.loc?`'${esc(c.loc)}'`:'null'})`;
+function chipsFor(d,c,cur){return `<div class="chips2">${c.values.map(v=>`<button class="${v===cur?'on':''}" ${d.online?'':'disabled'} onclick="${ctlJS(d,c,v)}">${MODE_IC[v]?sv(MODE_IC[v],15):''}${esc(lgVal(v))}</button>`).join('')}</div>`}
+function ctlWidget(d,c,full){
+  const cur=stLoc(d,c.res,c.key,c.loc),label=(c.loc?locName(c.loc)+' — ':'')+lgKey(c.key);
+  if(c.type==='range'){const v=+(cur??c.min);return `<div class="ctl"><span>${label}</span><div class="stepper"><button ${v<=c.min||!d.online?'disabled':''} onclick="${ctlJS(d,c,v-c.step)}" aria-label="-">−</button><b class="ltr">${cur??'—'}${/emperature/i.test(c.key)?'°':''}</b><button ${v>=c.max||!d.online?'disabled':''} onclick="${ctlJS(d,c,v+c.step)}" aria-label="+">+</button></div></div>`}
+  if(c.type==='boolean')return `<div class="ctl"><span>${label}</span><label class="switch"><input type="checkbox" ${cur?'checked':''} ${d.online?'':'disabled'} onchange="${ctlJS(d,c,'__B__').replace("'__B__'",'this.checked')}"><span></span></label></div>`;
+  if(cur===undefined&&c.values.length<=4)return `<div class="ctl"><span>${label}</span><div class="tv-row">${c.values.map(v=>`<button class="ibtn" ${d.online?'':'disabled'} onclick="${ctlJS(d,c,v)}">${esc(lgCmdLabel(v))}</button>`).join('')}</div></div>`;
+  if(full&&c.values.length<=6)return `<div class="ctl col"><span>${label}</span>${chipsFor(d,c,cur)}</div>`;
+  return `<div class="ctl"><span>${label}</span><select class="sel" ${d.online?'':'disabled'} onchange="lgCtl('${d.id}','${c.res}','${c.key}',this.value,${c.loc?`'${esc(c.loc)}'`:'null'})">${cur===undefined?'<option></option>':''}${c.values.map(v=>`<option value="${esc(v)}" ${v===cur?'selected':''}>${esc(lgVal(v))}</option>`).join('')}</select></div>`;
+}
+function timerHTML(d){
+  const c=d.controls.find(x=>x.res==='timer'&&x.key==='relativeHourToStop');if(!c)return '';
+  const h=stLoc(d,'timer','relativeHourToStop'),m=stLoc(d,'timer','relativeMinuteToStop'),active=(h||0)+(m||0)>0;
+  return `<div class="ctl col"><span>${active?t('autoOffIn',(h||0)+':'+two(m||0)):t('offAfterL')}</span><div class="chips2">${[1,2,4,8].filter(x=>x>=c.min&&x<=c.max).map(x=>`<button ${d.online?'':'disabled'} onclick="lgCtlMulti('${d.id}','timer',{relativeHourToStop:${x}})">${t('hShort',x)}</button>`).join('')}</div></div>`;
+}
+function powerOf(d){const c=d.controls.find(c_=>c_.type==='enum'&&c_.values.includes('POWER_ON')&&c_.values.includes('POWER_OFF'));return c?{c,on:stLoc(d,c.res,c.key)==='POWER_ON'}:null}
+function devHead(d,pw){return `<div class="dev-h"><div class="ico">${tIco(lgIcon(d.type),22)}</div>
     <div class="tx"><b>${esc(d.alias)}</b><small>${esc(lgType(d.type))}${d.model?t('sep')+esc(d.model):''}</small></div>
-    ${power?`<button class="pilot" aria-pressed="${isOn}" ${d.online?'':'disabled'} onclick="lgCtl('${d.id}','${power.res}','${power.key}','${isOn?'POWER_OFF':'POWER_ON'}')"></button>`:''}</div>
-    ${!d.online?`<div class="dev-err">${t('devOffline')}</div>`:d.error?`<div class="dev-err">${esc(d.error)}</div>`:''}
-    ${facts.length?`<div class="facts">${facts.map(([k,v])=>`<div class="fact"><small>${k==='remain'?t('remain'):lgKey(k)}</small><b>${esc(lgVal(v))}${/emperature/i.test(k)?'°':''}</b></div>`).join('')}</div>`:''}
-    ${ctls}
-    ${d.state.length?`<details><summary>${t('allReadings')}</summary>${d.state.map(x=>`<div class="kv"><span>${x.loc?esc(pretty(x.loc))+' — ':''}${esc(lgKey(x.key))}</span><b>${esc(lgVal(x.value))}</b></div>`).join('')}</details>`:''}
-  </div>`;
+    ${pw?`<button class="pilot ${pw.on?'is-on':'is-off'}" aria-pressed="${pw.on}" ${d.online?'':'disabled'} onclick="${ctlJS(d,pw.c,pw.on?'POWER_OFF':'POWER_ON')}"></button>`:''}</div>
+    ${!d.online?`<div class="dev-err">${t('devOffline')}</div>`:d.error?`<div class="dev-err">${esc(d.error)}</div>`:''}`}
+function thinqCard(d){
+  const pw=powerOf(d),cls=pw?(pw.on?'on':'off'):'';
+  const tgt=d.controls.find(c=>c.type==='range'&&c.key==='targetTemperature'&&!c.loc);
+  const mode=d.controls.find(c=>c.key==='currentJobMode'&&c.values);
+  const fan=d.controls.find(c=>/^wind(Strength|Step)$/.test(c.key)&&c.values);
+  const locT=d.controls.filter(c=>c.type==='range'&&c.loc&&/emperature/i.test(c.key));
+  const runSt=stLoc(d,null,'currentState');
+  let body='';
+  if(tgt){const v=+(stLoc(d,tgt.res,tgt.key)??tgt.min),room=stLoc(d,null,'currentTemperature');
+    body+=`<div class="thermo"><button class="rd" ${v<=tgt.min||!d.online?'disabled':''} onclick="${ctlJS(d,tgt,v-tgt.step)}" aria-label="-">−</button><div class="big"><b class="ltr">${v}°</b><small>${t('target')}</small></div><button class="rd" ${v>=tgt.max||!d.online?'disabled':''} onclick="${ctlJS(d,tgt,v+tgt.step)}" aria-label="+">+</button></div>
+      ${room!==undefined?`<div class="room-t">${t('roomT',room)}</div>`:''}`;
+    if(mode)body+=`<div><div class="lbl2">${t('modeL')}</div>${chipsFor(d,mode,stLoc(d,mode.res,mode.key))}</div>`;
+    if(fan)body+=`<div><div class="lbl2">${t('fanSpeed')}</div>${chipsFor(d,fan,stLoc(d,fan.res,fan.key))}</div>`;
+    const h=stLoc(d,'timer','relativeHourToStop'),m=stLoc(d,'timer','relativeMinuteToStop');
+    if((h||0)+(m||0)>0)body+=`<div class="chip-i t"><span>${sv(P.timer,13)} ${t('autoOffIn',(h||0)+':'+two(m||0))}</span></div>`;
+  }else if(runSt!==undefined){
+    const rh=stLoc(d,null,'remainHour')||0,rm=stLoc(d,null,'remainMinute')||0,th=stLoc(d,null,'totalHour'),tm=stLoc(d,null,'totalMinute');
+    const rem=rh*60+rm,tot=(th||0)*60+(tm||0),pct=tot?Math.max(0,Math.min(100,100-rem/tot*100)):(runSt==='END'?100:0);
+    body+=`<div class="wash"><div><small>${lgKey('currentState')}</small><b>${esc(lgVal(runSt))}</b></div>${rem?`<div style="text-align:end"><small>${t('remain')}</small><b class="ltr">${rh}:${two(rm)}</b>${tot?`<small>${t('progressOf',(th||0)+':'+two(tm||0))}</small>`:''}</div>`:''}</div>
+      ${rem||tot?`<div class="prog"><i style="width:${pct}%"></i></div>`:''}`;
+    d.controls.filter(c=>c.type==='enum'&&stLoc(d,c.res,c.key)===undefined&&c!==(pw&&pw.c)).slice(0,1).forEach(c=>body+=ctlWidget(d,c));
+  }else if(locT.length){
+    body+=locT.map(c=>{const v=+(stLoc(d,c.res,c.key,c.loc)??c.min);return `<div class="locrow"><b>${esc(locName(c.loc))}</b><div class="stepper"><button ${v<=c.min||!d.online?'disabled':''} onclick="${ctlJS(d,c,v-c.step)}">−</button><b class="ltr">${v}°</b><button ${v>=c.max||!d.online?'disabled':''} onclick="${ctlJS(d,c,v+c.step)}">+</button></div></div>`}).join('');
+  }else{
+    const facts=[];['currentTemperature','humidity','totalPollutionLevel','filterRemainPercent'].forEach(k=>{const v=stLoc(d,null,k);if(v!==undefined)facts.push([k,v])});
+    if(facts.length)body+=`<div class="facts">${facts.map(([k,v])=>`<div class="fact"><small>${lgKey(k)}</small><b>${esc(lgVal(v))}</b></div>`).join('')}</div>`;
+    d.controls.filter(c=>c!==(pw&&pw.c)&&!TIMER_RE.test(c.key)).slice(0,3).forEach(c=>body+=ctlWidget(d,c));
+  }
+  return `<div class="dev ${cls}">${devHead(d,pw)}${body}<div class="dev-acts"><button class="btn sm" onclick="openDev('${d.id}')">${t('more')}</button></div></div>`;
+}
+let DV=null;
+function openDev(id){DV=id;drawDev();openM('m-dev')}
+function drawDev(){
+  const d=S&&S.lg.thinq.devices.find(x=>x.id===DV),box=$('dev-body');if(!d||!box)return;
+  if(box.contains(document.activeElement)&&document.activeElement.tagName==='SELECT')return;
+  const pw=powerOf(d),rest=d.controls.filter(c=>c!==(pw&&pw.c)&&!TIMER_RE.test(c.key)&&!/^sleepTimer/.test(c.res));
+  box.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">${devHead(d,pw).replace('<div class="dev-h">','<div class="dev-h" style="flex:1">')}<button class="iconbtn" aria-label="${t('cancel')}" onclick="closeM('m-dev')">${sv('<path d="M6 6l12 12M18 6L6 18"/>',16)}</button></div>
+    <div style="margin-top:12px">${rest.length||timerHTML(d)?rest.map(c=>ctlWidget(d,c,true)).join('')+timerHTML(d):`<p class="hint">${t('noControls')}</p>`}</div>
+    ${d.state.length?`<details style="margin-top:12px" open><summary>${t('allReadings')}</summary>${d.state.filter(x=>!/TemperatureF$/.test(x.key)).map(x=>`<div class="kv"><span>${x.loc?esc(locName(x.loc))+' — ':''}${esc(lgKey(x.key))}</span><b>${esc(lgVal(x.value))}</b></div>`).join('')}</details>`:''}`;
 }
 function renderLG(){
   const L=S.lg,box=$('lg-home');if(!box)return;
@@ -3242,7 +3616,8 @@ function renderLG(){
     <div class="lg-grid">${tvs.map(tvCard).join('')}${devs.map(thinqCard).join('')}</div>`:'';
 }
 async function tvCmd(id,cmd,value){try{await api('/api/tv/cmd',{id,cmd,value})}catch(e){toast(e.message,1)}setTimeout(refresh,cmd==='power_on'?3000:900)}
-async function lgCtl(id,res,key,value){try{await api('/api/thinq/control',{id,res,key,value});toast(t('done'))}catch(e){toast(e.message,1)}setTimeout(refresh,2500)}
+async function lgCtl(id,res,key,value,loc){try{await api('/api/thinq/control',{id,res,key,value,loc:loc||null});toast(t('done'))}catch(e){toast(e.message,1)}setTimeout(refresh,2500)}
+async function lgCtlMulti(id,res,values,loc){try{await api('/api/thinq/control',{id,res,values,loc:loc||null});toast(t('done'))}catch(e){toast(e.message,1)}setTimeout(refresh,2500)}
 
 let FOUND=null,THQ_BUSY=false;
 function renderLGSettings(){
