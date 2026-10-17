@@ -632,10 +632,18 @@ class Strip:
         self.connected_at = 0.0
         self.has_data = False
         self.wlock = threading.Lock()
+        self.raw = collections.deque(maxlen=40)   # (ts, "in"/"out", line) for diagnostics
+        self.extra = {}       # records beyond outlets 1-4 (e.g. a USB channel), if the strip ever sends them
+        self.records = 0      # records in the last getinfo reply
+        self.leftover = ""    # text in the last getinfo reply that didn't match any record
+
+    def log_raw(self, d, line):
+        self.raw.append((time.time(), d, line[:600]))
 
     def send(self, cmd):
         with self.wlock:
             self.sock.sendall((cmd + "\r\n").encode("utf-8"))
+        self.log_raw("out", cmd)
 
 
 STRIPS = {}          # mac -> Strip (online sessions only)
@@ -644,9 +652,13 @@ STRIPS_LOCK = threading.Lock()
 
 def parse_getinfo(strip, line):
     recs = 0
-    for m in GETINFO_RE.finditer(line[len("up:getinfo:"):]):
+    body = line[len("up:getinfo:"):]
+    extra = {}
+    for m in GETINFO_RE.finditer(body):
         ch = int(m.group("ch"))
         if ch > 4:
+            extra[ch] = {"n": ch, "on": m.group("relay").lower() == "on",
+                         "power_w": round(int(m.group("power")) / 1000.0, 1)}
             continue
         fault = ""
         if m.group("ovl").lower() == "off" or m.group("event") == "01":
@@ -665,6 +677,10 @@ def parse_getinfo(strip, line):
         recs += 1
     if recs:
         strip.has_data = True
+        strip.records = recs + len(extra)
+        strip.extra = extra
+        rest = GETINFO_RE.sub("", body)
+        strip.leftover = re.sub(r"[\s;:,\x00]+", " ", rest).strip()[:300]
 
 
 class DeviceHandler(socketserver.BaseRequestHandler):
@@ -712,6 +728,7 @@ class DeviceHandler(socketserver.BaseRequestHandler):
 
     def on_line(self, strip, line):
         strip.last_seen = time.time()
+        strip.log_raw("in", line)
         m = BOOT_RE.match(line)
         if m:
             strip.model, strip.mac, strip.fw = m.group(1), m.group(2).upper(), m.group(4)
@@ -1793,6 +1810,7 @@ def state_json():
             "has_data": bool(s and s.has_data),
             "total_w": round(sum(o["power_w"] for o in outs if o["on"]), 1) if s else 0,
             "outlets": outs,
+            "extra": [s.extra[c] for c in sorted(s.extra)] if s else [],
         })
     return {
         "now": now,
@@ -1869,6 +1887,16 @@ class Web(BaseHTTPRequestHandler):
             return self._send(200, {"tvs": ssdp_discover_tvs()})
         if p == "/api/diag":
             return self._send(200, run_diagnostics())
+        if p == "/api/raw":
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            st = STRIPS.get((q.get("mac") or "").upper())
+            if not st:
+                return self._send(404, {"error": tr("المشترك مش متصل دلوقتي", "The strip isn't connected right now")})
+            return self._send(200, {
+                "label": strip_label(st.mac), "model": st.model, "fw": st.fw,
+                "records": st.records, "extra": [st.extra[c] for c in sorted(st.extra)],
+                "leftover": st.leftover,
+                "lines": [{"t": ts, "d": d, "line": ln} for ts, d, ln in st.raw]})
         if p in ("/api/energy", "/api/energy.xlsx"):
             q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
             mode = q.get("mode", "week")
@@ -2471,7 +2499,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .chip-i .link{font-size:11.5px;color:inherit}
 .fault{background:var(--off-d);color:#ffb3b3;border-radius:9px;padding:6px 9px;font-size:12px;text-align:center}
 .s-acts{display:flex;gap:6px;justify-content:center;margin-top:auto;padding-top:2px}
-.strip-f{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
+.strip-f{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:12px}.strip-f .raw-l{margin-inline-end:auto;font-size:12.5px}
 
 /* ---------- rooms view ---------- */
 .room{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);padding:6px 18px 8px}
@@ -2722,6 +2750,14 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 /* ---------- dialogs ---------- */
 .modal{position:fixed;inset:0;background:#060a0fcc;display:none;align-items:flex-start;justify-content:center;padding:48px 14px;overflow:auto;z-index:30}
 .modal.on{display:flex}
+.dlg.wide{max-width:720px}
+.rawv{background:#0a0f15;border:1px solid var(--line);border-radius:12px;padding:10px 12px;max-height:46vh;overflow:auto;direction:ltr;text-align:left;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}
+.rawv div{white-space:pre-wrap;word-break:break-all;padding:2px 0;border-bottom:1px solid #ffffff08}
+.rawv time{color:var(--muted);margin-right:8px}.rawv .in b{color:var(--on)}.rawv .out b{color:var(--copper)}
+.rawv b{font-weight:600;margin-right:6px}
+.raw-sum{border-radius:12px;padding:12px 14px;margin:12px 0;background:var(--raise);border-inline-start:3px solid var(--line2);font-size:13.5px;line-height:1.75}
+.raw-sum.found{border-inline-start-color:var(--on)}
+.pill.usb{color:var(--text)}.pill.usb.on i{background:var(--on)}.pill.usb.off i{background:var(--off)}
 .dlg{background:var(--panel);border:1px solid var(--line2);border-radius:var(--r-lg);width:100%;max-width:540px;padding:22px;box-shadow:0 30px 80px #000a}
 .dlg h3{margin:0 0 2px;font-size:18px;font-weight:600}
 .dlg .sub{color:var(--muted);font-size:13px;margin:0 0 8px}
@@ -2906,6 +2942,10 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 <div class="modal" id="m-remote" onclick="if(event.target===this)closeM('m-remote')">
   <div class="dlg remote" role="dialog" aria-modal="true" id="remote-body"></div>
 </div>
+<!-- raw strip messages -->
+<div class="modal" id="m-raw" onclick="if(event.target===this)closeM('m-raw')">
+  <div class="dlg wide" role="dialog" aria-modal="true" id="raw-body"></div>
+</div>
 <!-- LG appliance details -->
 <div class="modal" id="m-dev" onclick="if(event.target===this)closeM('m-dev')">
   <div class="dlg" role="dialog" aria-modal="true" id="dev-body"></div>
@@ -3007,7 +3047,10 @@ ar:{
  connOf:'{0} من {1} متصل',connNone:'مفيش مشترك متصل',appOff:'البرنامج مقفول',
  drawNow:'بيسحب دلوقتي',outletsOn:'فيش شغالة',todayUse:'استهلاك النهارده',activeSched:'مواعيد مفعّلة',
  addStrip:'إضافة مشترك',allOn:'شغّل البيت',allOff:'اطفي البيت',byStrip:'حسب المشترك',byRoom:'حسب الغرفة',
- roomHint:'دوس على اسم أي فيشة وحدد الغرفة بتاعتها',online:'متصل',offAgo:'غير متصل {0}',whyMissing:'ليه مش ظاهر؟',remove:'إزالة',
+ roomHint:'دوس على اسم أي فيشة وحدد الغرفة بتاعتها',online:'متصل',offAgo:'غير متصل {0}',whyMissing:'ليه مش ظاهر؟',rawBtn:'رسائل المشترك',rawTitle:'رسائل المشترك',rawCopy:'انسخ الرسائل',rawCopied:'اتنسخت',
+ rawWait:'مستني أول قراءة من المشترك…',rawOnly4:'المشترك بيبعت بيانات 4 فيش بس — مفيش أي بيانات عن منفذ USB. يعني الـ USB شحن ثابت مش متوصل بالشريحة الذكية.',
+ rawFound:'لقيت بيانات زيادة غير الأربع فيش (قناة {0}) — اضغط "انسخ الرسائل" وابعتها عشان نضيفها للبرنامج.',
+ usbCh:'قناة {0}',usbOn:'شغالة',usbOff:'مطفية',usbCharging:'بتشحن {0} واط',remove:'إزالة',
  stripName:'اسم المشترك',stripDraw:'سحب المشترك',stripOn:'شغّل الكل',stripOff:'اطفي الكل',
  stOn:'شغالة',stOff:'مطفية',stNa:'غير متصل',kwhToday:'kWh النهارده',editOutlet:'تعديل الفيشة',setAppliance:'+ حدد الجهاز',
  timer:'مؤقت',schedule:'موعد',offIn:'هتطفي بعد {0}',onIn:'هتشتغل بعد {0}',cancelIt:'إلغاء',nextOn:'تشغيل {0}',nextOff:'إطفاء {0}',queued:'أمر مستني المشترك يرجع',
@@ -3080,7 +3123,10 @@ en:{
  connOf:'{0} of {1} connected',connNone:'No strip connected',appOff:'App is closed',
  drawNow:'Drawing now',outletsOn:'Outlets on',todayUse:'Used today',activeSched:'Active schedules',
  addStrip:'Add strip',allOn:'All on',allOff:'All off',byStrip:'By strip',byRoom:'By room',
- roomHint:'Tap an outlet name to set its room',online:'Online',offAgo:'Offline {0}',whyMissing:'Why is it missing?',remove:'Remove',
+ roomHint:'Tap an outlet name to set its room',online:'Online',offAgo:'Offline {0}',whyMissing:'Why is it missing?',rawBtn:'Strip messages',rawTitle:'Strip messages',rawCopy:'Copy messages',rawCopied:'Copied',
+ rawWait:'Waiting for the first reading from the strip…',rawOnly4:'The strip only reports its 4 outlets — there is no USB data. The USB ports are a fixed charger, not wired to the smart controller.',
+ rawFound:'Found data beyond the 4 outlets (channel {0}) — press "Copy messages" and send them so it can be added to the app.',
+ usbCh:'Channel {0}',usbOn:'on',usbOff:'off',usbCharging:'charging {0} W',remove:'Remove',
  stripName:'Strip name',stripDraw:'Strip draw',stripOn:'Turn all on',stripOff:'Turn all off',
  stOn:'On',stOff:'Off',stNa:'Offline',kwhToday:'kWh today',editOutlet:'Edit outlet',setAppliance:'+ Set appliance',
  timer:'Timer',schedule:'Schedule',offIn:'Off in {0}',onIn:'On in {0}',cancelIt:'Cancel',nextOn:'On {0}',nextOff:'Off {0}',queued:'Command waiting for the strip',
@@ -3238,7 +3284,7 @@ function renderHome(){
 
 function stripHTML(d){
   const meta=d.online
-    ?`<span class="pill ok"><i></i>${t('online')}</span><span class="ltr">${esc(d.ip)}</span>`
+    ?`<span class="pill ok"><i></i>${t('online')}</span><span class="ltr">${esc(d.ip)}</span>${(d.extra||[]).map(x=>`<span class="pill usb ${x.on?'on':'off'}"><i></i>${t('usbCh',x.n)}: ${x.on?(x.power_w>0.3?t('usbCharging',x.power_w.toFixed(1)):t('usbOn')):t('usbOff')}</span>`).join('')}`
     :`<span class="pill"><i></i>${t('offAgo',ago(d.last_seen))}</span><button class="link" onclick="tab('settings');runDiag()">${t('whyMissing')}</button><button class="link" onclick="forget('${d.mac}')">${t('remove')}</button>`;
   return `<section class="strip${d.online?'':' is-off'}">
     <header class="strip-h"><div class="strip-id">
@@ -3247,7 +3293,7 @@ function stripHTML(d){
       ${d.online?`<div class="strip-w"><b class="ltr">${d.has_data?d.total_w.toFixed(1):'—'}<small>W</small></b><span>${t('stripDraw')}</span></div>`:''}
     </header>
     <div class="bar">${d.outlets.map(o=>slotHTML(d,o)).join('')}</div>
-    ${d.online?`<footer class="strip-f"><button class="btn ghost sm" onclick="all_('${d.mac}',true)">${t('stripOn')}</button><button class="btn ghost sm danger" onclick="all_('${d.mac}',false)">${t('stripOff')}</button></footer>`:''}
+    ${d.online?`<footer class="strip-f"><button class="link raw-l" onclick="showRaw('${d.mac}')">${t('rawBtn')}</button><button class="btn ghost sm" onclick="all_('${d.mac}',true)">${t('stripOn')}</button><button class="btn ghost sm danger" onclick="all_('${d.mac}',false)">${t('stripOff')}</button></footer>`:''}
   </section>`;
 }
 function infoHTML(d,o){
@@ -3600,6 +3646,24 @@ function thinqCard(d){
   return `<div class="dev ${cls}">${devHead(d,pw)}${body}<div class="dev-acts"><button class="btn sm" onclick="openDev('${d.id}')">${t('more')}</button></div></div>`;
 }
 let DV=null;
+let RAWMAC=null,RAWT=null;
+async function showRaw(mac){RAWMAC=mac;await drawRaw();openM('m-raw');const v=$('raw-body').querySelector('.rawv');if(v)v.scrollTop=v.scrollHeight;clearInterval(RAWT);
+  RAWT=setInterval(()=>{if(!$('m-raw').classList.contains('on')){clearInterval(RAWT);return}drawRaw()},3000)}
+async function drawRaw(){const box=$('raw-body');let d;
+  try{d=await getJSON('/api/raw?mac='+encodeURIComponent(RAWMAC))}catch(e){box.innerHTML=`<h3>${t('rawTitle')}</h3><div class="err">${esc(e.message)}</div>`;return}
+  const found=d.extra.length||d.leftover;
+  const sum=!d.records?t('rawWait'):found
+    ?t('rawFound',d.extra.map(x=>x.n).join('، ')||'—')+(d.leftover?`<br><span class="ltr">${esc(d.leftover)}</span>`:'')
+    :t('rawOnly4');
+  const keep=box.querySelector('.rawv'),atEnd=!keep||keep.scrollTop+keep.clientHeight>=keep.scrollHeight-8;
+  box.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px"><div><h3>${t('rawTitle')}</h3><p class="lead" style="margin:2px 0 0">${esc(d.label)} · <span class="ltr">${esc(d.model)} ${esc(d.fw)}</span></p></div><button class="iconbtn" aria-label="${t('cancel')}" onclick="closeM('m-raw')">${sv('<path d="M6 6l12 12M18 6L6 18"/>',16)}</button></div>
+  <div class="raw-sum${found?' found':''}">${sum}</div>
+  <div class="rawv">${d.lines.map(x=>`<div class="${x.d}"><time>${new Date(x.t*1000).toLocaleTimeString('en-GB')}</time><b>${x.d==='in'?'⇠':'⇢'}</b>${esc(x.line)}</div>`).join('')||'—'}</div>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button class="btn ghost sm" onclick="copyRaw()">${t('rawCopy')}</button></div>`;
+  const v=box.querySelector('.rawv');if(atEnd)v.scrollTop=v.scrollHeight;window._raw=d}
+function copyRaw(){const d=window._raw;if(!d)return;
+  const txt=d.lines.map(x=>new Date(x.t*1000).toISOString()+' '+(x.d==='in'?'<-':'->')+' '+x.line).join('\n');
+  (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast(t('rawCopied')),()=>{const ta=document.createElement('textarea');ta.value=txt;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();toast(t('rawCopied'))})}
 function openDev(id){DV=id;drawDev();openM('m-dev')}
 function drawDev(){
   const d=S&&S.lg.thinq.devices.find(x=>x.id===DV),box=$('dev-body');if(!d||!box)return;

@@ -14,6 +14,7 @@ Local control for the Korean **LG U+ / TONLY MTTL-W01** 4-outlet smart power str
 - LG TVs (webOS), all local: full remote (arrows/OK, back, home, settings, number pad, colour keys, media keys; keyboard shortcuts on a computer), launch any installed app with its real icon, volume slider, inputs, type text into the TV, screen off with sound on, power on via Wake-on-LAN
 - LG ThinQ appliances through LG's official ThinQ Connect API: air-conditioner thermostat with modes, fan speed and off-timer; washer/dryer progress and a log entry when a cycle finishes; fridge and freezer temperatures; every other setting the device exposes
 - Guided Wi-Fi setup for new strips, network diagnostics, optional password
+- **Strip messages** view on each strip: the live raw protocol log, with a check for any data beyond the 4 outlets (e.g. a USB channel), shown on the strip if found
 - Arabic and English interface
 - SQLite storage (`mttl.db`)
 
