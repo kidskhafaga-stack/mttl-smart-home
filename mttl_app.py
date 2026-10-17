@@ -22,6 +22,7 @@ import collections
 import datetime
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import os
@@ -36,6 +37,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as xml_escape
@@ -82,6 +84,8 @@ CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS energy_daily (
     day TEXT, mac TEXT, n INTEGER, wh REAL, PRIMARY KEY (day, mac, n));
+CREATE TABLE IF NOT EXISTS energy_hourly (
+    hour TEXT, mac TEXT, n INTEGER, wh REAL, PRIMARY KEY (hour, mac, n));
 """
 _db_lock = threading.RLock()
 DB = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
@@ -358,29 +362,238 @@ def record_energy(mac, n, wh):
         with _db_lock:
             db("UPDATE outlets SET last_energy_wh=? WHERE mac=? AND n=?", (wh, mac, n))
             if delta > 0:
+                now = datetime.datetime.now()
                 db("INSERT INTO energy_daily(day, mac, n, wh) VALUES(?,?,?,?) "
                    "ON CONFLICT(day, mac, n) DO UPDATE SET wh = wh + excluded.wh",
-                   (datetime.date.today().isoformat(), mac, n, delta))
+                   (now.date().isoformat(), mac, n, delta))
+                db("INSERT INTO energy_hourly(hour, mac, n, wh) VALUES(?,?,?,?) "
+                   "ON CONFLICT(hour, mac, n) DO UPDATE SET wh = wh + excluded.wh",
+                   (now.strftime("%Y-%m-%d %H"), mac, n, delta))
     except sqlite3.Error as e:
         log("energy db error:", e)
 
 
-def energy_report(days):
-    end = datetime.date.today()
-    start = end - datetime.timedelta(days=days - 1)
-    dates = [(start + datetime.timedelta(days=i)).isoformat() for i in range(days)]
-    pos = {d: i for i, d in enumerate(dates)}
+def _month_add(d, k):
+    m = d.year * 12 + (d.month - 1) + k
+    return datetime.date(m // 12, m % 12 + 1, 1)
+
+
+def _month_end(d):
+    return _month_add(d, 1) - datetime.timedelta(days=1)
+
+
+def energy_period(mode, day=None, frm=None, to=None):
+    """Return (bucket_kind, start_date, end_date)."""
+    today = datetime.date.today()
+    if mode == "day":
+        try:
+            d = datetime.date.fromisoformat(day) if day else today
+        except ValueError:
+            d = today
+        return "hour", d, d
+    if mode == "month":
+        return "day", today.replace(day=1), _month_end(today)
+    if mode == "year":
+        return "month", _month_add(today.replace(day=1), -11), today
+    if mode == "custom":
+        try:
+            a, b = datetime.date.fromisoformat(frm), datetime.date.fromisoformat(to)
+        except (TypeError, ValueError):
+            a, b = today - datetime.timedelta(days=6), today
+        if a > b:
+            a, b = b, a
+        if (b - a).days > 365:
+            a = b - datetime.timedelta(days=365)
+        return "day", a, b
+    return "day", today - datetime.timedelta(days=6), today          # week
+
+
+def _bucket_keys(kind, start, end):
+    if kind == "hour":
+        return ["%s %02d" % (start.isoformat(), h) for h in range(24)]
+    if kind == "month":
+        keys, d = [], start.replace(day=1)
+        while d <= end:
+            keys.append(d.strftime("%Y-%m"))
+            d = _month_add(d, 1)
+        return keys
+    return [(start + datetime.timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+
+
+def _energy_rows(kind, start, end):
+    """Yield (bucket_key, mac, n, wh)."""
+    if kind == "hour":
+        for h, mac, n, wh in db("SELECT hour, mac, n, wh FROM energy_hourly WHERE hour >= ? AND hour <= ?",
+                                (start.isoformat() + " 00", end.isoformat() + " 23")):
+            yield h, mac, n, wh
+        return
+    for d, mac, n, wh in db("SELECT day, mac, n, wh FROM energy_daily WHERE day >= ? AND day <= ?",
+                            (start.isoformat(), end.isoformat())):
+        yield (d[:7] if kind == "month" else d), mac, n, wh
+
+
+def _sum_daily(a, b):
+    """Total Wh between two dates, or None if fewer than 80% of the days have readings
+    (comparing against a half-recorded period would be misleading)."""
+    total, days = db("SELECT SUM(wh), COUNT(DISTINCT day) FROM energy_daily WHERE day >= ? AND day <= ?",
+                     (a.isoformat(), b.isoformat()))[0]
+    if not total or days < 0.8 * ((b - a).days + 1):
+        return None
+    return total
+
+
+def _previous_total(mode, kind, start, end):
+    """Usage in the comparable previous period (None when there is no data)."""
+    today = datetime.date.today()
+    if kind == "hour":
+        prev = start - datetime.timedelta(days=1)
+        last_h = datetime.datetime.now().hour if start == today else 23
+        total, hours = db("SELECT SUM(wh), COUNT(DISTINCT hour) FROM energy_hourly WHERE hour >= ? AND hour <= ?",
+                          (prev.isoformat() + " 00", "%s %02d" % (prev.isoformat(), last_h)))[0]
+        if not total or hours < 0.6 * (last_h + 1):
+            return None
+        return total
+    if mode == "month":
+        pm = _month_add(start, -1)
+        upto = min(today.day, _month_end(pm).day)
+        return _sum_daily(pm, pm.replace(day=upto))
+    if kind == "month":
+        return _sum_daily(_month_add(start, -12), start - datetime.timedelta(days=1))
+    length = (end - start).days + 1
+    return _sum_daily(start - datetime.timedelta(days=length), start - datetime.timedelta(days=1))
+
+
+def energy_report(mode="week", day=None, frm=None, to=None):
+    kind, start, end = energy_period(mode, day, frm, to)
+    keys = _bucket_keys(kind, start, end)
+    pos = {k: i for i, k in enumerate(keys)}
     per = {}
-    for day, mac, n, wh in db("SELECT day, mac, n, wh FROM energy_daily WHERE day >= ?", (start.isoformat(),)):
-        if day in pos:
-            per.setdefault((mac, n), [0.0] * days)[pos[day]] += wh
+    for key, mac, n, wh in _energy_rows(kind, start, end):
+        if key in pos:
+            per.setdefault((mac, n), [0.0] * len(keys))[pos[key]] += wh
     items = [{"mac": mac, "n": n, "name": outlet_label(mac, n), "strip": strip_label(mac),
               "type": outlet_type(mac, n), "room": outlet_room(mac, n),
-              "per_day": [round(x, 1) for x in v], "total": round(sum(v), 1)}
+              "buckets": [round(x, 1) for x in v], "total": round(sum(v), 1)}
              for (mac, n), v in per.items()]
     items.sort(key=lambda x: -x["total"])
-    totals = [round(sum(it["per_day"][i] for it in items), 1) for i in range(days)]
-    return {"days": dates, "totals": totals, "items": items, "price": CFG.get("price_kwh", 0)}
+    totals = [round(sum(it["buckets"][i] for it in items), 1) for i in range(len(keys))]
+    prev = _previous_total(mode, kind, start, end)
+    return {"mode": mode, "kind": kind, "start": start.isoformat(), "end": end.isoformat(),
+            "keys": keys, "totals": totals, "total": round(sum(totals), 1),
+            "prev_total": round(prev, 1) if prev else None,
+            "items": items, "price": CFG.get("price_kwh", 0)}
+
+
+# ---------------------------------------------------------------- tiny .xlsx writer (no dependencies)
+def _col(i):
+    s = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def write_xlsx(sheets, rtl=False):
+    """sheets: list of (name, rows, widths); first row is a bold header."""
+    esc = lambda v: xml_escape(str(v)).replace('"', "&quot;")
+    files = {}
+    for si, (name, rows, widths) in enumerate(sheets, 1):
+        out = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+               '<sheetViews><sheetView workbookViewId="0"%s><pane ySplit="1" topLeftCell="A2" state="frozen"/></sheetView></sheetViews>'
+               % (' rightToLeft="1"' if rtl else '')]
+        out.append("<cols>%s</cols>" % "".join('<col min="%d" max="%d" width="%s" customWidth="1"/>' % (i + 1, i + 1, w)
+                                                 for i, w in enumerate(widths)))
+        out.append("<sheetData>")
+        for ri, row in enumerate(rows, 1):
+            cells = []
+            for ci, v in enumerate(row):
+                ref = "%s%d" % (_col(ci), ri)
+                style = ' s="1"' if ri == 1 else (' s="2"' if isinstance(v, float) else "")
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    cells.append('<c r="%s"%s><v>%s</v></c>' % (ref, style, v))
+                elif v not in (None, ""):
+                    cells.append('<c r="%s" t="inlineStr"%s><is><t>%s</t></is></c>' % (ref, style, esc(v)))
+            out.append('<row r="%d">%s</row>' % (ri, "".join(cells)))
+        out.append("</sheetData></worksheet>")
+        files["xl/worksheets/sheet%d.xml" % si] = "".join(out)
+    names = [esc(n[:31]) for n, _, _ in sheets]
+    files["[Content_Types].xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + "".join('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i
+                  for i in range(1, len(sheets) + 1)) + "</Types>")
+    files["_rels/.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>")
+    files["xl/workbook.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+        + "".join('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (n, i, i) for i, n in enumerate(names, 1))
+        + "</sheets></workbook>")
+    files["xl/_rels/workbook.xml.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%d.xml"/>' % (i, i)
+                  for i in range(1, len(sheets) + 1))
+        + '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' % (len(sheets) + 1)
+        + "</Relationships>")
+    files["xl/styles.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<numFmts count="1"><numFmt numFmtId="164" formatCode="0.000"/></numFmts>'
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFF3E3CC"/><bgColor indexed="64"/></patternFill></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+        '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        "</styleSheet>")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in ("[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels", "xl/styles.xml"):
+            z.writestr(name, files.pop(name))
+        for name, data in files.items():
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+def energy_xlsx(rep_):
+    en = CFG.get("lang") == "en"
+    price = rep_["price"] or 0
+    L = (lambda a, e: e if en else a)
+    head = [L("الجهاز", "Appliance"), L("الغرفة", "Room"), L("المشترك", "Strip"), L("الفيشة", "Outlet"), "kWh"]
+    if price:
+        head.append(L("التكلفة (جنيه)", "Cost (EGP)"))
+    rows = [head]
+    for it in rep_["items"]:
+        r = [it["name"], it["room"], it["strip"], it["n"], round(it["total"] / 1000.0, 3)]
+        if price:
+            r.append(round(it["total"] / 1000.0 * price, 2))
+        rows.append(r)
+    tot = [L("الإجمالي", "Total"), "", "", "", round(rep_["total"] / 1000.0, 3)]
+    if price:
+        tot.append(round(rep_["total"] / 1000.0 * price, 2))
+    rows.append(tot)
+    period_h = {"hour": L("الساعة", "Hour"), "day": L("اليوم", "Date"), "month": L("الشهر", "Month")}[rep_["kind"]]
+    detail = [[period_h] + [it["name"] for it in rep_["items"]] + [L("الإجمالي", "Total")]]
+    for i, k in enumerate(rep_["keys"]):
+        label = (k[-2:] + ":00") if rep_["kind"] == "hour" else k
+        detail.append([label] + [round(it["buckets"][i] / 1000.0, 3) for it in rep_["items"]]
+                      + [round(rep_["totals"][i] / 1000.0, 3)])
+    return write_xlsx([(L("ملخص", "Summary"), rows, [22, 16, 18, 9, 12, 14]),
+                       (L("تفاصيل", "Detail"), detail, [14] + [16] * (len(rep_["items"]) + 1))], rtl=not en)
 
 
 def today_wh():
@@ -1018,12 +1231,14 @@ class Web(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="application/json; charset=utf-8", cookie=None):
+    def _send(self, code, body, ctype="application/json; charset=utf-8", cookie=None, headers=None):
         if not isinstance(body, bytes):
             body = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
+        for hk, hv in (headers or {}).items():
+            self.send_header(hk, hv)
         if cookie is not None:
             self.send_header("Set-Cookie", "mttl_s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d"
                              % (cookie, 31536000 if cookie else 0))
@@ -1059,13 +1274,17 @@ class Web(BaseHTTPRequestHandler):
             return self._send(200, page_html().encode("utf-8"), "text/html; charset=utf-8")
         if p == "/api/diag":
             return self._send(200, run_diagnostics())
-        if p == "/api/energy":
-            q = parse_qs(urlparse(self.path).query)
-            try:
-                days = max(1, min(90, int(q.get("days", ["7"])[0])))
-            except ValueError:
-                days = 7
-            return self._send(200, energy_report(days))
+        if p in ("/api/energy", "/api/energy.xlsx"):
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            mode = q.get("mode", "week")
+            if mode not in ("day", "week", "month", "year", "custom"):
+                mode = "week"
+            r = energy_report(mode, q.get("day"), q.get("from"), q.get("to"))
+            if p == "/api/energy":
+                return self._send(200, r)
+            return self._send(200, energy_xlsx(r),
+                              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                              headers={"Content-Disposition": 'attachment; filename="energy-%s-%s.xlsx"' % (r["start"], r["end"])})
         if p == "/api/state":
             return self._send(200, state_json())
         if p == "/api/wifi":
@@ -1573,8 +1792,24 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .col.today i{opacity:1;box-shadow:0 0 18px #e0a45840}
 .col b{font-size:11px;color:var(--muted);margin-bottom:4px;font-weight:400}
 .col-l{display:flex;gap:5px;margin-top:7px}
-.col-l span{flex:1;text-align:center;font-size:11px;color:var(--faint);min-width:0;overflow:hidden;white-space:nowrap}
+.col-l span{flex:1;display:flex;justify-content:center;font-size:11px;color:var(--faint);min-width:0;overflow:visible;white-space:nowrap}
 .price{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:18px}
+.en-bar{justify-content:flex-start}
+.en-pick{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.en-pick input{width:auto;padding:7px 10px;font-size:14px}
+.en-pick .nav-d{border:1px solid var(--line);background:var(--panel);border-radius:9px;padding:6px 9px;color:var(--muted);display:grid;place-items:center}
+.en-pick .nav-d:hover:not(:disabled){color:var(--text)}
+.en-pick .nav-d:disabled{opacity:.35;cursor:not-allowed}
+.cmp{display:inline-block;margin-top:4px;font-size:12.5px;padding:2px 8px;border-radius:999px}
+.cmp.up{background:var(--off-d);color:#ffa4a4}.cmp.down{background:var(--on-d);color:var(--on)}.cmp.flat{background:var(--raise);color:var(--muted)}
+.chart-h{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:4px;min-height:24px}
+.chart-h b{font-weight:500;font-size:14px;color:var(--muted)}
+.col.peak i{opacity:1}
+.col:hover i{opacity:1;filter:brightness(1.12)}
+.ap{cursor:pointer;border-radius:10px}
+.ap:hover{background:#ffffff05}
+.ap.sel{background:var(--copper-d)}
+.ap.dim{opacity:.45}
 .price input{width:110px}
 .ap{display:grid;grid-template-columns:40px minmax(0,1fr) auto;gap:14px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}
 .ap:first-of-type{border-top:0}
@@ -1680,17 +1915,23 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
     </section>
 
     <section id="v-energy" class="view">
-      <div class="toolbar"><span class="hint" style="margin:0" data-t="enLead"></span>
-        <div class="seg" id="en-range"><button data-v="7" class="on" data-t="d7"></button><button data-v="30" data-t="d30"></button></div></div>
+      <div class="toolbar en-bar">
+        <div class="seg" id="en-mode"><button data-v="day" data-t="pDay"></button><button data-v="week" class="on" data-t="pWeek"></button><button data-v="month" data-t="pMonth"></button><button data-v="year" data-t="pYear"></button><button data-v="custom" data-t="pCustom"></button></div>
+        <div class="en-pick" id="en-pick"></div>
+        <button class="btn sm" onclick="exportXlsx()" style="margin-inline-start:auto"><span id="xl-ico"></span><span data-t="export"></span></button>
+      </div>
       <div class="panel">
         <div class="kpis" id="en-k"></div>
+        <div class="chart-h"><b id="en-ttl"></b><button class="link" id="en-clear" onclick="EN.sel=null;drawEnergy()" style="display:none" data-t="showAll"></button></div>
         <div class="chart" id="en-bars"></div>
         <div class="col-l" id="en-lbl"></div>
         <div class="price"><span class="hint" style="margin:0" data-t="priceLbl"></span><input type="number" id="en-price" min="0" step="0.01" class="ltr"><span class="hint" style="margin:0" data-t="egp"></span><button class="btn sm" onclick="savePrice()" data-t="save"></button></div>
       </div>
       <div class="panel">
-        <h2 data-t="byAppliance"></h2>
-        <div id="en-items" style="margin-top:8px"></div>
+        <div class="toolbar" style="margin-bottom:6px"><h2 style="margin:0" data-t="breakdown"></h2>
+          <div class="seg" id="en-group"><button data-v="app" class="on" data-t="byAppliance"></button><button data-v="room" data-t="byRoom"></button></div></div>
+        <p class="hint" style="margin:0 0 6px" data-t="tapToFilter"></p>
+        <div id="en-items"></div>
       </div>
     </section>
 
@@ -1899,6 +2140,9 @@ ar:{
  q15:'ربع ساعة',q30:'نص ساعة',q60:'ساعة',q120:'ساعتين',q240:'4 ساعات',q480:'8 ساعات',
  olTitle:'إيه المتوصل في الفيشة دي؟',olFor:'{0}، فيشة رقم {1}',olName:'اسم الفيشة',olNamePh:'مثلاً: تلفزيون الصالة',olType:'نوع الجهاز',olRoom:'الغرفة',olRoomPh:'مثلاً: الصالة',
  enLead:'محسوب من عداد كل فيشة. لو البرنامج كان مقفول، اللي اتصرف وقتها بيتحسب على أول يوم يفتح فيه.',d7:'7 أيام',d30:'30 يوم',
+ pDay:'يوم',pWeek:'أسبوع',pMonth:'الشهر',pYear:'السنة',pCustom:'فترة',export:'Excel',from:'من',to:'إلى',showAll:'كل الأجهزة',breakdown:'التوزيع',tapToFilter:'دوس على أي جهاز علشان الرسم يوريك استهلاكه لوحده.',
+ enTotal:'الاستهلاك',vsPrev:'{0} عن {1}',more:'أكتر',less:'أقل',same:'زي',prevDay:'امبارح',prevWeek:'الأسبوع اللي فات',prevMonth:'نفس الفترة الشهر اللي فات',prevYear:'السنة اللي قبلها',prevCustom:'الفترة اللي قبلها',prevOtherDay:'اليوم اللي قبله',
+ avgHour:'متوسط الساعة',avgDay2:'متوسط اليوم',avgMonth:'متوسط الشهر',peakHour:'أعلى ساعة',peakDay:'أعلى يوم',peakMonth:'أعلى شهر',allDevices:'كل الأجهزة',noData:'لسه مفيش قراءات في الفترة دي.',hourNoteOld:'تفاصيل الساعات بتتسجل من النسخة دي وطالع.',
  total7:'إجمالي آخر 7 أيام',total30:'إجمالي آخر 30 يوم',avgDay:'متوسط اليوم',today:'النهارده',costEst:'التكلفة التقريبية',priceLbl:'سعر الكيلووات/ساعة',egp:'جنيه',
  byAppliance:'حسب الجهاز',noReadings:'لسه مفيش قراءات. الاستهلاك بيتسجل أول ما المشترك يتصل وأي جهاز يسحب كهربا.',savedPrice:'اتحفظ السعر',
  setupTitle:'ضيف مشترك واربطه بشبكة البيت',setupLead:'البرنامج بيبعت للمشترك اسم الواي فاي والباسورد وعنوان الجهاز ده. بعدها المشترك بيتصل لوحده كل ما يشتغل. اربطهم واحد واحد.',
@@ -1953,6 +2197,9 @@ en:{
  q15:'15 min',q30:'30 min',q60:'1 hour',q120:'2 hours',q240:'4 hours',q480:'8 hours',
  olTitle:'What\'s plugged in here?',olFor:'{0}, outlet {1}',olName:'Outlet name',olNamePh:'e.g. Living room TV',olType:'Appliance type',olRoom:'Room',olRoomPh:'e.g. Living room',
  enLead:'Calculated from each outlet\'s meter. If the app was closed, that usage is counted on the day it reopens.',d7:'7 days',d30:'30 days',
+ pDay:'Day',pWeek:'Week',pMonth:'Month',pYear:'Year',pCustom:'Range',export:'Excel',from:'From',to:'To',showAll:'All appliances',breakdown:'Breakdown',tapToFilter:'Tap an appliance to chart it on its own.',
+ enTotal:'Used',vsPrev:'{0} than {1}',more:'more',less:'less',same:'same as',prevDay:'yesterday',prevWeek:'the previous week',prevMonth:'the same days last month',prevYear:'the previous year',prevCustom:'the previous period',prevOtherDay:'the day before',
+ avgHour:'Hourly average',avgDay2:'Daily average',avgMonth:'Monthly average',peakHour:'Peak hour',peakDay:'Peak day',peakMonth:'Peak month',allDevices:'All appliances',noData:'No readings in this period yet.',hourNoteOld:'Hourly detail is recorded from this version on.',
  total7:'Last 7 days',total30:'Last 30 days',avgDay:'Daily average',today:'Today',costEst:'Estimated cost',priceLbl:'Price per kWh',egp:'EGP',
  byAppliance:'By appliance',noReadings:'No readings yet. Usage is recorded once a strip connects and something draws power.',savedPrice:'Price saved',
  setupTitle:'Add a strip and connect it to your Wi-Fi',setupLead:'The app sends the strip your Wi-Fi name, password and this computer\'s address. After that the strip connects on its own every time it powers up. Add strips one at a time.',
@@ -2023,10 +2270,10 @@ function applyLang(){
   $('lang-btn').innerHTML=sv(P.globe,15)+(LANG==='ar'?'English':'العربية');
   $('new-rule').textContent=t('newRule');
   segSet('lang-seg',LANG);
-  buildNav();buildDays();buildQuick();
+  buildNav();buildDays();buildQuick();buildPick();$('xl-ico').innerHTML=sv('<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',15);
   const T=TABS.find(x=>x[0]===curTab);$('pg-title').textContent=t(T[1]==='navHome'?'app':T[1]);$('pg-sub').textContent=t(T[2]);
 }
-async function setLang(l){if(l===LANG)return;LANG=l;applyLang();render();renderLog();if(curTab==='energy')loadEnergy();if(curTab==='settings')renderPw();
+async function setLang(l){if(l===LANG)return;LANG=l;applyLang();render();renderLog();if(curTab==='energy')drawEnergy();if(curTab==='settings')renderPw();
   try{await api('/api/lang',{lang:LANG})}catch(e){}refresh()}
 function switchLang(){setLang(LANG==='ar'?'en':'ar')}
 
@@ -2040,7 +2287,7 @@ async function refresh(){
   else w.style.display='none';
   render();renderLog();
 }
-function render(){if(!S||editing)return;if(curTab==='home')renderHome();if(curTab==='sched')renderSched();if(curTab==='energy'&&Date.now()-EN_AT>30000)loadEnergy()}
+function render(){if(!S||editing)return;if(curTab==='home')renderHome();if(curTab==='sched')renderSched();if(curTab==='energy'&&Date.now()-EN_AT>60000&&(EN.mode!=='custom'))loadEnergy()}
 
 /* ---------------- home ---------------- */
 let VIEW=(()=>{try{return localStorage.getItem('mttl_view')||'strip'}catch(e){return 'strip'}})();
@@ -2227,24 +2474,63 @@ async function delRule(id){if(!confirm(t('confirmDel')))return;try{await api('/a
 async function runRule(id){try{await api('/api/schedule/run',{id});toast(t('done'))}catch(e){toast(e.message,1)}setTimeout(refresh,800)}
 
 /* ---------------- energy ---------------- */
-let EN_DAYS=7,EN_AT=0;
-segBind('en-range',v=>{EN_DAYS=+v;loadEnergy()});
-async function loadEnergy(){
-  EN_AT=Date.now();let E;try{E=await getJSON('/api/energy?days='+EN_DAYS)}catch(e){return}
-  const price=E.price||0,sum=E.totals.reduce((a,b)=>a+b,0),max=Math.max(1,...E.totals),cost=wh=>price?(wh/1000*price).toFixed(2)+' '+t('egp'):'';
+const isoD=d=>d.getFullYear()+'-'+two(d.getMonth()+1)+'-'+two(d.getDate());
+let EN={mode:'week',day:isoD(new Date()),from:'',to:'',sel:null,group:'app',data:null},EN_AT=0;
+(()=>{const t0=new Date(),a=new Date(t0);a.setDate(a.getDate()-29);EN.from=isoD(a);EN.to=isoD(t0)})();
+segBind('en-mode',v=>{EN.mode=v;EN.sel=null;buildPick();loadEnergy()});
+segBind('en-group',v=>{EN.group=v;EN.sel=null;drawEnergy()});
+function buildPick(){
+  const p=$('en-pick'),today=isoD(new Date());
+  if(EN.mode==='day')p.innerHTML=`<button class="nav-d" onclick="shiftDay(-1)" aria-label="-1">${sv(LANG==='ar'?'<path d="M9 6l6 6-6 6"/>':'<path d="M15 6l-6 6 6 6"/>',16)}</button><input type="date" id="en-day" class="ltr" value="${EN.day}" max="${today}" onchange="EN.day=this.value;loadEnergy()"><button class="nav-d" onclick="shiftDay(1)" ${EN.day>=today?'disabled':''} aria-label="+1">${sv(LANG==='ar'?'<path d="M15 6l-6 6 6 6"/>':'<path d="M9 6l6 6-6 6"/>',16)}</button>`;
+  else if(EN.mode==='custom')p.innerHTML=`<span class="hint" style="margin:0">${t('from')}</span><input type="date" class="ltr" value="${EN.from}" max="${today}" onchange="EN.from=this.value;loadEnergy()"><span class="hint" style="margin:0">${t('to')}</span><input type="date" class="ltr" value="${EN.to}" max="${today}" onchange="EN.to=this.value;loadEnergy()">`;
+  else p.innerHTML='';
+}
+function shiftDay(k){const d=new Date(EN.day+'T12:00');d.setDate(d.getDate()+k);const s=isoD(d);if(s>isoD(new Date()))return;EN.day=s;buildPick();loadEnergy()}
+function enQuery(){return 'mode='+EN.mode+(EN.mode==='day'?'&day='+EN.day:'')+(EN.mode==='custom'?'&from='+EN.from+'&to='+EN.to:'')}
+async function loadEnergy(){EN_AT=Date.now();try{EN.data=await getJSON('/api/energy?'+enQuery())}catch(e){return}drawEnergy()}
+function exportXlsx(){location.href='/api/energy.xlsx?'+enQuery()}
+function bucketLabel(k,kind,full){
+  const loc=LANG==='ar'?'ar-EG-u-nu-latn':'en-GB';
+  if(kind==='hour'){const h=+k.slice(-2);return full?clock(h,0):String(h)}
+  if(kind==='month'){const d=new Date(k+'-01T12:00');return d.toLocaleDateString(loc,full?{month:'long',year:'numeric'}:{month:'short'})}
+  const d=new Date(k+'T12:00');
+  if(full)return d.toLocaleDateString(loc,{weekday:'long',day:'numeric',month:'long'});
+  return EN.data.keys.length<=7?t('dShort')[(d.getDay()+6)%7]:d.getDate()+'/'+(d.getMonth()+1);
+}
+function groups(E){
+  if(EN.group==='app')return E.items.map(it=>({key:it.mac+':'+it.n,name:it.name,sub:it.room||it.strip,type:it.type,buckets:it.buckets,total:it.total}));
+  const g={};E.items.forEach(it=>{const k=it.room||'';const x=g[k]=g[k]||{key:'room:'+k,name:k||t('roomNone'),sub:'',type:null,buckets:it.buckets.map(()=>0),total:0};
+    it.buckets.forEach((v,i)=>x.buckets[i]+=v);x.total+=it.total;x.sub=(x.sub?x.sub+t('sep'):'')+it.name});
+  return Object.values(g).sort((a,b)=>b.total-a.total);
+}
+function drawEnergy(){
+  const E=EN.data;if(!E)return;
+  const price=E.price||0,cost=wh=>price?(wh/1000*price).toFixed(2)+' '+t('egp'):'';
   if(document.activeElement!==$('en-price'))$('en-price').value=price||'';
-  $('en-k').innerHTML=`<div class="kpi"><span class="lbl">${t(EN_DAYS===7?'total7':'total30')}</span><b class="ltr">${kwh(sum)}<small>kWh</small></b></div>
-    <div class="kpi"><span class="lbl">${t('avgDay')}</span><b class="ltr">${kwh(sum/EN_DAYS)}<small>kWh</small></b></div>
-    <div class="kpi"><span class="lbl">${t('today')}</span><b class="ltr">${kwh(E.totals[E.totals.length-1])}<small>kWh</small></b></div>
-    ${price?`<div class="kpi"><span class="lbl">${t('costEst')}</span><b>${(sum/1000*price).toFixed(2)}<small>${t('egp')}</small></b></div>`:''}`;
-  const days=E.days, tot=E.totals;
-  $('en-bars').innerHTML=tot.map((v,i)=>`<div class="col${i===tot.length-1?' today':''}" title="${days[i]}: ${kwh(v)} kWh${price?' — '+cost(v):''}">${EN_DAYS===7&&v?`<b>${kwh(v)}</b>`:''}<i style="height:${v/max*100}%"></i></div>`).join('');
-  $('en-lbl').innerHTML=days.map((d,i)=>{const x=new Date(d+'T00:00'),show=EN_DAYS===7||i%5===0||i===days.length-1;
-    return `<span>${show?(EN_DAYS===7?t('dShort')[(x.getDay()+6)%7]:x.getDate()+'/'+(x.getMonth()+1)):''}</span>`}).join('');
-  const top=Math.max(1,...E.items.map(i=>i.total));
-  $('en-items').innerHTML=E.items.length?E.items.map(it=>`<div class="ap"><div class="ico">${tIco(it.type,20)}</div>
-      <div class="tx" style="min-width:0"><b>${esc(it.name)}</b><small>${esc(it.room||it.strip)}</small><div class="meter"><i style="width:${it.total/top*100}%"></i></div></div>
-      <div class="v"><b class="ltr">${kwh(it.total)} kWh</b><small>${cost(it.total)||(sum?Math.round(it.total/sum*100)+'%':'')}</small></div></div>`).join('')
+  const G=groups(E),sel=EN.sel&&G.find(g=>g.key===EN.sel);if(EN.sel&&!sel)EN.sel=null;
+  const series=sel?sel.buckets:E.totals,total=sel?sel.total:E.total,n=series.length;
+  const today=isoD(new Date());
+  let used=n;if(E.kind==='day'&&E.end>today)used=E.keys.filter(k=>k<=today).length;
+  if(E.kind==='hour'&&E.start===today)used=new Date().getHours()+1;
+  const avg=total/Math.max(1,used),peakI=series.indexOf(Math.max(...series));
+  const prevName={day:E.start===today?'prevDay':'prevOtherDay',week:'prevWeek',month:'prevMonth',year:'prevYear',custom:'prevCustom'}[E.mode];
+  let cmp='';
+  if(!sel&&E.prev_total){const d=(E.total-E.prev_total)/E.prev_total,pc=Math.round(Math.abs(d)*100);
+    cmp=pc<2?`<span class="cmp flat">${t('vsPrev',t('same'),t(prevName))}</span>`:`<span class="cmp ${d>0?'up':'down'}">${d>0?'▲':'▼'} ${pc}% ${t('vsPrev',t(d>0?'more':'less'),t(prevName))}</span>`}
+  const avgK={hour:'avgHour',day:'avgDay2',month:'avgMonth'}[E.kind],peakK={hour:'peakHour',day:'peakDay',month:'peakMonth'}[E.kind];
+  $('en-k').innerHTML=`<div class="kpi"><span class="lbl">${t('enTotal')}</span><b class="ltr">${kwh(total)}<small>kWh</small></b>${price?`<span class="hint" style="display:block;margin:0">${cost(total)}</span>`:''}${cmp?'<div>'+cmp+'</div>':''}</div>
+    <div class="kpi"><span class="lbl">${t(avgK)}</span><b class="ltr">${kwh(avg)}<small>kWh</small></b></div>
+    ${total?`<div class="kpi"><span class="lbl">${t(peakK)}</span><b style="font-size:17px">${bucketLabel(E.keys[peakI],E.kind,true)}</b><span class="hint" style="display:block;margin:0">${kwh(series[peakI])} kWh</span></div>`:''}`;
+  $('en-ttl').textContent=sel?sel.name:t('allDevices');$('en-clear').style.display=sel?'':'none';
+  const max=Math.max(1,...series),showVal=n<=8;
+  $('en-bars').innerHTML=total?series.map((v,i)=>`<div class="col${i===peakI&&v?' peak':''}${(E.kind==='hour'&&E.start===today&&i===new Date().getHours())||(E.kind==='day'&&E.keys[i]===today)?' today':''}" title="${esc(bucketLabel(E.keys[i],E.kind,true))}: ${kwh(v)} kWh${price?' — '+cost(v):''}">${showVal&&v?`<b>${kwh(v)}</b>`:''}<i style="height:${v/max*100}%"></i></div>`).join('')
+    :`<p class="hint" style="align-self:center;margin:auto">${t('noData')}${E.kind==='hour'?' '+t('hourNoteOld'):''}</p>`;
+  const step=n<=8?1:n<=12?1:n<=24?3:n<=31?5:Math.ceil(n/8);
+  $('en-lbl').innerHTML=E.keys.map((k,i)=>`<span>${i%step===0||i===n-1?bucketLabel(k,E.kind,false):''}</span>`).join('');
+  const top=Math.max(1,...G.map(g=>g.total));
+  $('en-items').innerHTML=G.length?G.map(g=>`<div class="ap${EN.sel===g.key?' sel':EN.sel?' dim':''}" onclick="EN.sel=EN.sel==='${esc(g.key)}'?null:'${esc(g.key)}';drawEnergy()"><div class="ico">${g.type!==null?tIco(g.type,20):sv(P.home,20)}</div>
+      <div class="tx" style="min-width:0"><b>${esc(g.name)}</b><small>${esc(g.sub)}</small><div class="meter"><i style="width:${g.total/top*100}%"></i></div></div>
+      <div class="v"><b class="ltr">${kwh(g.total)} kWh</b><small>${cost(g.total)||(E.total?Math.round(g.total/E.total*100)+'%':'')}</small></div></div>`).join('')
     :`<p class="hint">${t('noReadings')}</p>`;
 }
 async function savePrice(){try{await api('/api/price',{price:+$('en-price').value||0});toast(t('savedPrice'));await refresh();loadEnergy()}catch(e){toast(e.message,1)}}
