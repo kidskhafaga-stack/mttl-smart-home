@@ -11,6 +11,7 @@ Local control for the Korean **LG U+ / TONLY MTTL-W01** 4-outlet smart power str
 - Timers (on for / off after / on after) and schedules (repeat days or one-time, optional auto-off)
 - Charger mode: switch off automatically when a phone or laptop finishes charging, or when nothing is charging at all
 - Energy dashboard: day (hourly), week, month, year or any date range; comparison with the previous period; breakdown by appliance or room; cost in EGP; Excel export
+- Electricity bill calculator with Egyptian residential tiers (editable): enter the home's monthly kWh to see the bill, your tier, what the strip appliances add to it, and a warning near a pricier tier (above 1000 kWh every unit is billed at the top price)
 - LG TVs (webOS), all local: full remote (arrows/OK, back, home, settings, number pad, colour keys, media keys; keyboard shortcuts on a computer), launch any installed app with its real icon, volume slider, inputs, type text into the TV, screen off with sound on, power on via Wake-on-LAN
 - LG ThinQ appliances through LG's official ThinQ Connect API: air-conditioner thermostat with modes, fan speed and off-timer; washer/dryer progress and a log entry when a cycle finishes; fridge and freezer temperatures; every other setting the device exposes
 - Guided Wi-Fi setup for new strips, network diagnostics, optional password

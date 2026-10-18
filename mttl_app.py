@@ -479,6 +479,61 @@ def _previous_total(mode, kind, start, end):
     return _sum_daily(start - datetime.timedelta(days=length), start - datetime.timedelta(days=1))
 
 
+# ---------------------------------------------------------------- Egyptian residential bill
+# Default: residential tariff from Aug 2026 as published on aseskahraba.com (editable in the app).
+# Tiers are progressive; above the last limit the "over" price applies to ALL units.
+DEFAULT_TARIFF = {"tiers": [[50, 0.68], [100, 0.95], [200, 1.15], [350, 1.72], [650, 2.18], [1000, 2.40]],
+                  "over": 2.74, "fee": 25.0, "since": "2026-08"}
+
+
+def get_tariff():
+    t = CFG.get("tariff")
+    return t if isinstance(t, dict) and t.get("tiers") else DEFAULT_TARIFF
+
+
+def bill_calc(kwh, t=None):
+    t = t or get_tariff()
+    kwh = max(0.0, float(kwh))
+    tiers, over = t["tiers"], t.get("over")
+    lines, prev, tier, marginal = [], 0.0, 1, tiers[0][1]
+    if over and kwh > tiers[-1][0]:
+        lines.append({"from": 0, "to": None, "price": over, "units": round(kwh, 2), "amount": round(kwh * over, 2)})
+        tier, marginal = len(tiers) + 1, over
+    else:
+        for i, (lim, pr) in enumerate(tiers):
+            last = i == len(tiers) - 1
+            u = (kwh - prev) if last else max(0.0, min(kwh, lim) - prev)
+            if u > 0 or i == 0:
+                if u > 0:
+                    lines.append({"from": prev, "to": lim, "price": pr, "units": round(u, 2), "amount": round(u * pr, 2)})
+                tier, marginal = i + 1, pr
+            prev = lim
+            if kwh <= lim:
+                break
+    energy = round(sum(x["amount"] for x in lines), 2)
+    fee = float(t.get("fee") or 0)
+    # next boundary (for the "close to next tier" warning)
+    nxt = next((lim for lim, _ in tiers if lim > kwh), None)
+    return {"kwh": round(kwh, 2), "lines": lines, "energy": energy, "fee": fee, "total": round(energy + fee, 2),
+            "tier": tier, "marginal": marginal, "next_limit": nxt}
+
+
+def bill_json(house=None):
+    t = get_tariff()
+    house = CFG.get("house_kwh") if house is None else house
+    month_wh = energy_report("month")["total"]
+    out = {"tariff": t, "default": t is DEFAULT_TARIFF, "house_kwh": house,
+           "strips_kwh": round(month_wh / 1000.0, 2), "price_kwh": CFG.get("price_kwh", 0)}
+    if house:
+        b = bill_calc(house, t)
+        sk = min(out["strips_kwh"], house)
+        out["bill"] = b
+        out["strips_cost"] = round(b["energy"] - bill_calc(house - sk, t)["energy"], 2)
+        # cost of the next 50 kWh: shows the jump at a tier boundary (e.g. 1000 -> flat price)
+        out["next50_cost"] = round(bill_calc(house + 50, t)["energy"] - b["energy"], 2)
+    return out
+
+
 def energy_report(mode="week", day=None, frm=None, to=None):
     kind, start, end = energy_period(mode, day, frm, to)
     keys = _bucket_keys(kind, start, end)
@@ -1931,6 +1986,13 @@ class Web(BaseHTTPRequestHandler):
                 "records": st.records, "extra": [st.extra[c] for c in sorted(st.extra)],
                 "leftover": st.leftover,
                 "lines": [{"t": ts, "d": d, "line": ln} for ts, d, ln in st.raw]})
+        if p == "/api/bill":
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            try:
+                h = float(q["house"]) if q.get("house") else None
+            except ValueError:
+                h = None
+            return self._send(200, bill_json(h))
         if p in ("/api/energy", "/api/energy.xlsx"):
             q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
             mode = q.get("mode", "week")
@@ -2242,6 +2304,32 @@ class Web(BaseHTTPRequestHandler):
                     CFG["lang"] = b["lang"]
                     save_cfg()
                 return self._send(200, {"ok": True})
+
+            if p == "/api/tariff":
+                with LOCK:
+                    if "house_kwh" in b:
+                        h = float(b.get("house_kwh") or 0)
+                        if not 0 <= h <= 100000:
+                            return self._send(400, {"error": tr("الاستهلاك مش منطقي", "Consumption out of range")})
+                        CFG["house_kwh"] = h or None
+                    if b.get("reset"):
+                        CFG.pop("tariff", None)
+                    elif "tiers" in b:
+                        tiers = []
+                        for lim, pr in b["tiers"]:
+                            lim, pr = float(lim), float(pr)
+                            if not (0 < lim <= 100000 and 0 <= pr <= 100) or (tiers and lim <= tiers[-1][0]):
+                                return self._send(400, {"error": tr("حدود الشرايح لازم تكون بتزيد", "Tier limits must increase")})
+                            tiers.append([lim, pr])
+                        over = float(b.get("over") or 0)
+                        fee = float(b.get("fee") or 0)
+                        if not tiers or not 0 <= over <= 100 or not 0 <= fee <= 10000:
+                            return self._send(400, {"error": tr("أسعار غلط", "Invalid prices")})
+                        CFG["tariff"] = {"tiers": tiers, "over": over or None, "fee": fee, "since": "custom"}
+                    if b.get("use_marginal") and CFG.get("house_kwh"):
+                        CFG["price_kwh"] = bill_calc(CFG["house_kwh"])["marginal"]
+                    save_cfg()
+                return self._send(200, bill_json())
 
             if p == "/api/price":
                 price = float(b.get("price") or 0)
@@ -2628,6 +2716,26 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .col-l{display:flex;gap:5px;margin-top:7px}
 .col-l span{flex:1;display:flex;justify-content:center;font-size:11px;color:var(--faint);min-width:0;overflow:visible;white-space:nowrap}
 .price{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:18px}
+.bill-top{display:flex;flex-wrap:wrap;gap:18px 34px;align-items:flex-end;margin:20px 0 14px}
+.bill-top .big b{font-size:34px;font-weight:600;letter-spacing:-.5px}.bill-top .big small{font-size:15px;color:var(--muted);margin-inline-start:6px}
+.bill-top .lbl{display:block;font-size:12.5px;color:var(--muted);margin-bottom:2px}
+.bill-top .m b{font-size:20px;font-weight:600}
+.tiers{display:flex;gap:3px;margin:6px 0 4px;direction:ltr}
+.tiers div{flex:1;height:30px;border-radius:7px;background:var(--raise);position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted)}
+.tiers div i{position:absolute;inset:0 auto 0 0;background:linear-gradient(90deg,#e0a45855,#e0a458aa)}
+.tiers div span{position:relative}
+.tiers div.cur{outline:1.5px solid var(--copper);color:var(--text)}
+.tiers div.flat i{background:linear-gradient(90deg,#f06a6a66,#f06a6aaa)}
+.tier-l{display:flex;gap:3px;direction:ltr;font-size:10.5px;color:var(--muted)}.tier-l span{flex:1;text-align:center}
+.bill-t{width:100%;border-collapse:collapse;font-size:13px;margin-top:14px}
+.bill-t td,.bill-t th{padding:7px 6px;border-bottom:1px solid var(--line);text-align:start}
+.bill-t th{color:var(--muted);font-weight:500;font-size:12px}.bill-t td.n{text-align:end;unicode-bidi:isolate;font-variant-numeric:tabular-nums}
+.bill-t tr.tot td{font-weight:600;border-bottom:0}
+.bill-note{border-radius:12px;padding:11px 14px;margin-top:12px;background:var(--raise);font-size:13.5px;line-height:1.75;border-inline-start:3px solid var(--line2)}
+.bill-note.mine{border-inline-start-color:var(--on)}.bill-note.warn{border-inline-start-color:var(--copper)}.bill-note.bad{border-inline-start-color:var(--off)}
+details.tariff{margin-top:16px}details.tariff summary{cursor:pointer;color:var(--muted);font-size:13px}
+.tar-g{display:grid;grid-template-columns:1fr 1fr;gap:8px 10px;margin-top:12px;max-width:420px}
+.tar-g label{font-size:12px;color:var(--muted)}.tar-g input{width:100%}
 .en-bar{justify-content:flex-start}
 .en-pick{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .en-pick input{width:auto;padding:7px 10px;font-size:14px}
@@ -2911,6 +3019,13 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
         <p class="hint" style="margin:0 0 6px" data-t="tapToFilter"></p>
         <div id="en-items"></div>
       </div>
+      <div class="panel" id="bill-p">
+        <h2 data-t="billTitle"></h2>
+        <p class="lead" data-t="billLead"></p>
+        <div class="price" style="margin-top:6px"><span class="hint" style="margin:0" data-t="houseKwh"></span><input type="number" id="bill-h" min="0" step="1" class="ltr" style="width:110px" onkeydown="if(event.key==='Enter')saveHouse()"><span class="hint" style="margin:0">kWh</span><button class="btn primary sm" onclick="saveHouse()" data-t="calc"></button></div>
+        <div id="bill-out"></div>
+        <details class="tariff"><summary data-t="tariffEdit"></summary><div id="tariff-ed"></div></details>
+      </div>
     </section>
 
     <section id="v-setup" class="view">
@@ -3145,6 +3260,17 @@ ar:{
  enTotal:'الاستهلاك',vsPrev:'{0} عن {1}',more:'أكتر',less:'أقل',same:'زي',prevDay:'امبارح',prevWeek:'الأسبوع اللي فات',prevMonth:'نفس الفترة الشهر اللي فات',prevYear:'السنة اللي قبلها',prevCustom:'الفترة اللي قبلها',prevOtherDay:'اليوم اللي قبله',
  avgHour:'متوسط الساعة',avgDay2:'متوسط اليوم',avgMonth:'متوسط الشهر',peakHour:'أعلى ساعة',peakDay:'أعلى يوم',peakMonth:'أعلى شهر',allDevices:'كل الأجهزة',noData:'لسه مفيش قراءات في الفترة دي.',hourNoteOld:'تفاصيل الساعات بتتسجل من النسخة دي وطالع.',
  total7:'إجمالي آخر 7 أيام',total30:'إجمالي آخر 30 يوم',avgDay:'متوسط اليوم',today:'النهارده',costEst:'التكلفة التقريبية',priceLbl:'سعر الكيلووات/ساعة',egp:'جنيه',
+ billTitle:'فاتورة الكهربا',billLead:'اكتب استهلاك البيت كله في الشهر (من العداد أو آخر فاتورة)، والبرنامج يحسب الفاتورة بالشرايح، ويقولك أجهزة المشتركات واخدة كام منها، ولو قربت من شريحة أغلى.',
+ houseKwh:'استهلاك البيت في الشهر',calc:'احسب',billTotal:'الفاتورة التقريبية',yourTier:'شريحتك',tierN:'الشريحة {0}',nextKwh:'سعر الكيلو الجاي',
+ stripsShare:'الأجهزة اللي على المشتركات سحبت {0} kWh الشهر ده — يعني حوالي {1} ج من الفاتورة.',
+ nearTier:'فاضلك {0} كيلو وتدخل الشريحة اللي بعدها — كل 50 كيلو زيادة هتكلفك {1} ج.',
+ nearFlat:'خلي بالك: فاضلك {0} كيلو وتعدّي الـ 1000 — ساعتها كل الاستهلاك بيتحاسب بأغلى سعر، و50 كيلو زيادة هتكلفك {1} ج.',
+ flatNow:'إنت فوق الـ 1000 كيلو، فكل الاستهلاك متحاسب بسعر {0} ج للكيلو. لو نزلت تحت 1000 الفاتورة هتقل كتير.',
+ useTierQ:'سعر الكيلو في شريحتك {0} ج. تحب تحسب تكلفة الأجهزة بيه؟',useTier:'استخدمه',
+ band:'الشريحة (كيلو)',units:'الكيلوهات',unitPrice:'سعر الكيلو',amount:'المبلغ',allUnits:'كل الاستهلاك',svcFee:'رسم خدمة العملاء',
+ billEmpty:'اكتب استهلاك البيت فوق علشان تشوف الفاتورة. أجهزة المشتركات سحبت {0} kWh الشهر ده.',
+ tariffSrc:'أسعار الشرايح من أول أغسطس 2026 حسب موقع "أسس كهربا" (مش مصدر رسمي)، والحساب تقريبي. قارنه بفاتورتك، ولو في فرق عدّل الأسعار من تحت.',
+ tariffCustom:'بتستخدم أسعار شرايح إنت عدّلتها.',tariffEdit:'تعديل أسعار الشرايح',upTo:'لحد',overPrice:'فوق آخر شريحة (على كل الاستهلاك)',tariffReset:'رجّع الأسعار الأصلية',saved:'اتحفظ',
  byAppliance:'حسب الجهاز',noReadings:'لسه مفيش قراءات. الاستهلاك بيتسجل أول ما المشترك يتصل وأي جهاز يسحب كهربا.',savedPrice:'اتحفظ السعر',
  setupTitle:'ضيف مشترك واربطه بشبكة البيت',setupLead:'البرنامج بيبعت للمشترك اسم الواي فاي والباسورد وعنوان الجهاز ده. بعدها المشترك بيتصل لوحده كل ما يشتغل. اربطهم واحد واحد.',
  homeWifi:'شبكة البيت (2.4GHz)',homePw:'باسورد شبكة البيت',showPw:'إظهار الباسورد',pcIp:'عنوان الجهاز ده على شبكة البيت',
@@ -3223,6 +3349,17 @@ en:{
  enTotal:'Used',vsPrev:'{0} than {1}',more:'more',less:'less',same:'same as',prevDay:'yesterday',prevWeek:'the previous week',prevMonth:'the same days last month',prevYear:'the previous year',prevCustom:'the previous period',prevOtherDay:'the day before',
  avgHour:'Hourly average',avgDay2:'Daily average',avgMonth:'Monthly average',peakHour:'Peak hour',peakDay:'Peak day',peakMonth:'Peak month',allDevices:'All appliances',noData:'No readings in this period yet.',hourNoteOld:'Hourly detail is recorded from this version on.',
  total7:'Last 7 days',total30:'Last 30 days',avgDay:'Daily average',today:'Today',costEst:'Estimated cost',priceLbl:'Price per kWh',egp:'EGP',
+ billTitle:'Electricity bill',billLead:'Enter the whole home\'s monthly use (from the meter or your last bill). The app works out the tiered bill, how much of it the strip appliances account for, and warns you near a pricier tier.',
+ houseKwh:'Home use per month',calc:'Calculate',billTotal:'Estimated bill',yourTier:'Your tier',tierN:'Tier {0}',nextKwh:'Price of the next kWh',
+ stripsShare:'Appliances on your strips used {0} kWh this month — about {1} EGP of the bill.',
+ nearTier:'{0} kWh until the next tier — each extra 50 kWh costs {1} EGP.',
+ nearFlat:'Careful: {0} kWh until you pass 1000 — then all units are billed at the top price, and 50 kWh more costs {1} EGP.',
+ flatNow:'You\'re above 1000 kWh, so every unit is billed at {0} EGP. Dropping under 1000 cuts the bill a lot.',
+ useTierQ:'Your tier\'s price is {0} EGP/kWh. Use it for appliance costs?',useTier:'Use it',
+ band:'Band (kWh)',units:'kWh',unitPrice:'Price/kWh',amount:'Amount',allUnits:'All units',svcFee:'Customer service fee',
+ billEmpty:'Enter your home\'s use above to see the bill. Strip appliances used {0} kWh this month.',
+ tariffSrc:'Tier prices from 1 Aug 2026 as listed on aseskahraba.com (not an official source); the result is an estimate. Compare with your bill and adjust the prices below if needed.',
+ tariffCustom:'Using tier prices you edited.',tariffEdit:'Edit tier prices',upTo:'Up to',overPrice:'Above the last tier (all units)',tariffReset:'Restore default prices',saved:'Saved',
  byAppliance:'By appliance',noReadings:'No readings yet. Usage is recorded once a strip connects and something draws power.',savedPrice:'Price saved',
  setupTitle:'Add a strip and connect it to your Wi-Fi',setupLead:'The app sends the strip your Wi-Fi name, password and this computer\'s address. After that the strip connects on its own every time it powers up. Add strips one at a time.',
  homeWifi:'Home Wi-Fi (2.4 GHz)',homePw:'Wi-Fi password',showPw:'Show password',pcIp:'This computer\'s address on your Wi-Fi',
@@ -3527,7 +3664,7 @@ function buildPick(){
 }
 function shiftDay(k){const d=new Date(EN.day+'T12:00');d.setDate(d.getDate()+k);const s=isoD(d);if(s>isoD(new Date()))return;EN.day=s;buildPick();loadEnergy()}
 function enQuery(){return 'mode='+EN.mode+(EN.mode==='day'?'&day='+EN.day:'')+(EN.mode==='custom'?'&from='+EN.from+'&to='+EN.to:'')}
-async function loadEnergy(){EN_AT=Date.now();try{EN.data=await getJSON('/api/energy?'+enQuery())}catch(e){return}drawEnergy()}
+async function loadEnergy(){EN_AT=Date.now();loadBill();try{EN.data=await getJSON('/api/energy?'+enQuery())}catch(e){return}drawEnergy()}
 function exportXlsx(){location.href='/api/energy.xlsx?'+enQuery()}
 function bucketLabel(k,kind,full){
   const loc=LANG==='ar'?'ar-EG-u-nu-latn':'en-GB';
@@ -3573,6 +3710,48 @@ function drawEnergy(){
       <div class="v"><b class="ltr">${kwh(g.total)} kWh</b><small>${cost(g.total)||(E.total?Math.round(g.total/E.total*100)+'%':'')}</small></div></div>`).join('')
     :`<p class="hint">${t('noReadings')}</p>`;
 }
+/* ---- electricity bill (Egyptian tiers) ---- */
+let BILL=null;
+const egp=v=>(+v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+async function loadBill(){try{BILL=await getJSON('/api/bill')}catch(e){return}drawBill()}
+async function saveHouse(){const v=+$('bill-h').value||0;try{BILL=await api('/api/tariff',{house_kwh:v});drawBill()}catch(e){toast(e.message,1)}}
+async function useMarginal(){try{BILL=await api('/api/tariff',{use_marginal:true});await refresh();toast(t('savedPrice'));loadEnergy();drawBill()}catch(e){toast(e.message,1)}}
+function drawBill(){const B=BILL;if(!B)return;const T=B.tariff;
+  if(document.activeElement!==$('bill-h'))$('bill-h').value=B.house_kwh||'';
+  let h='';
+  if(B.bill){const b=B.bill,n=T.tiers.length,top=T.tiers[n-1][0],flat=T.over&&b.kwh>top;
+    h+=`<div class="bill-top"><div class="big"><span class="lbl">${t('billTotal')}</span><b class="ltr">${egp(b.total)}</b><small>${t('egp')}</small></div>
+      <div class="m"><span class="lbl">${t('yourTier')}</span><b>${t('tierN',b.tier)}</b></div>
+      <div class="m"><span class="lbl">${t('nextKwh')}</span><b class="ltr">${egp(b.marginal)}</b> <small class="hint">${t('egp')}</small></div></div>`;
+    // tier bar
+    let prev=0;h+='<div class="tiers">'+T.tiers.map(([lim,pr],i)=>{const f=flat?100:Math.max(0,Math.min(100,(b.kwh-prev)/(lim-prev)*100));prev=lim;
+      return `<div class="${b.tier===i+1?'cur':''}${flat?' flat':''}"><i style="width:${f}%"></i><span>${pr}</span></div>`}).join('')
+      +(T.over?`<div class="${flat?'cur flat':''}"><i style="width:${flat?100:0}%"></i><span>${T.over}</span></div>`:'')+'</div>';
+    prev=0;h+='<div class="tier-l">'+T.tiers.map(([lim])=>{const x=`<span>${prev}–${lim}</span>`;prev=lim;return x}).join('')+(T.over?`<span>+${top}</span>`:'')+'</div>';
+    // notes
+    const sc=B.strips_kwh>0;
+    if(sc)h+=`<div class="bill-note mine">${t('stripsShare',`<b class="ltr">${B.strips_kwh}</b>`,`<b class="ltr">${egp(B.strips_cost)}</b>`)}</div>`;
+    if(b.next_limit&&b.next_limit-b.kwh<=50){const jump=T.over&&b.next_limit===top;
+      h+=`<div class="bill-note ${jump?'bad':'warn'}">${t(jump?'nearFlat':'nearTier',`<b class="ltr">${Math.ceil(b.next_limit-b.kwh)}</b>`,`<b class="ltr">${egp(B.next50_cost)}</b>`)}</div>`}
+    if(flat)h+=`<div class="bill-note bad">${t('flatNow',`<b class="ltr">${T.over}</b>`)}</div>`;
+    if(Math.abs((B.price_kwh||0)-b.marginal)>0.001)h+=`<div class="bill-note">${t('useTierQ',`<b class="ltr">${egp(b.marginal)}</b>`)} <button class="btn sm" style="margin-inline-start:6px" onclick="useMarginal()">${t('useTier')}</button></div>`;
+    // breakdown table
+    h+=`<table class="bill-t"><tr><th>${t('band')}</th><th style="text-align:end">${t('units')}</th><th style="text-align:end">${t('unitPrice')}</th><th style="text-align:end">${t('amount')}</th></tr>`
+      +b.lines.map(l=>`<tr><td>${l.to==null?t('allUnits'):`<span class="ltr">${l.from}–${l.to}</span>`}</td><td class="n">${l.units}</td><td class="n">${l.price}</td><td class="n">${egp(l.amount)}</td></tr>`).join('')
+      +(b.fee?`<tr><td>${t('svcFee')}</td><td></td><td></td><td class="n">${egp(b.fee)}</td></tr>`:'')
+      +`<tr class="tot"><td>${t('billTotal')}</td><td class="n">${b.kwh}</td><td></td><td class="n">${egp(b.total)} ${t('egp')}</td></tr></table>`;
+  }else h+=`<p class="hint" style="margin-top:14px">${t('billEmpty',`<b class="ltr">${B.strips_kwh}</b>`)}</p>`;
+  h+=`<p class="hint" style="margin-top:12px">${B.default?t('tariffSrc'):t('tariffCustom')}</p>`;
+  $('bill-out').innerHTML=h;
+  // editor
+  if(!$('tariff-ed').contains(document.activeElement)){let prev=0;
+    $('tariff-ed').innerHTML=`<div class="tar-g">${T.tiers.map(([lim,pr],i)=>{const x=`<label>${t('upTo')} <span class="ltr">(${prev}–)</span><input type="number" class="ltr tl" value="${lim}"></label><label>${t('unitPrice')}<input type="number" step="0.01" class="ltr tp" value="${pr}"></label>`;prev=lim;return x}).join('')}
+      <label>${t('overPrice')}<input type="number" step="0.01" class="ltr" id="tar-over" value="${T.over||''}"></label><label>${t('svcFee')}<input type="number" step="0.5" class="ltr" id="tar-fee" value="${T.fee||0}"></label></div>
+      <div style="display:flex;gap:8px;margin-top:12px"><button class="btn sm primary" onclick="saveTariff()">${t('save')}</button>${B.default?'':`<button class="btn sm ghost" onclick="saveTariff(true)">${t('tariffReset')}</button>`}</div>`}
+}
+async function saveTariff(reset){const ed=$('tariff-ed');const lims=[...ed.querySelectorAll('.tl')].map(i=>+i.value),prs=[...ed.querySelectorAll('.tp')].map(i=>+i.value);
+  const body=reset?{reset:true}:{tiers:lims.map((l,i)=>[l,prs[i]]),over:+$('tar-over').value||0,fee:+$('tar-fee').value||0};
+  try{BILL=await api('/api/tariff',body);document.activeElement.blur();drawBill();toast(t('saved'))}catch(e){toast(e.message,1)}}
 async function savePrice(){try{await api('/api/price',{price:+$('en-price').value||0});toast(t('savedPrice'));await refresh();loadEnergy()}catch(e){toast(e.message,1)}}
 
 /* ---------------- LG ---------------- */
